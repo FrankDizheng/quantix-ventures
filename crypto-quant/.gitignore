@@ -11,9 +11,9 @@ venv/
 .env
 .env.*
 
-# Data & caches (raw downloads can be large)
-data/
-caches/
+# Data & caches (raw downloads can be large) — root only, not src/crypto_quant/data/
+/data/
+/caches/
 *.parquet
 *.feather
 
