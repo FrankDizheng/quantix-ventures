@@ -24,3 +24,12 @@ def data_dir(cfg: dict[str, Any] | None = None) -> Path:
     raw = cfg.get("data_dir", "data")
     p = Path(raw)
     return p if p.is_absolute() else repo_root() / p
+
+
+def dune_api_key(cfg: dict[str, Any] | None = None) -> str:
+    """Read Dune API key from env (name configured in default.yaml)."""
+    import os
+
+    cfg = cfg or load_config()
+    env_name = cfg.get("dune", {}).get("api_key_env", "DUNE_API_KEY")
+    return os.environ.get(env_name, "").strip()

@@ -13,6 +13,7 @@ from crypto_quant.data import (
     BinanceVisionFetcher,
     CCXTFetcher,
     CoinGeckoFetcher,
+    DuneClient,
     save_dataframe,
 )
 from crypto_quant.backtest import (
@@ -423,6 +424,25 @@ def backtest_batch_cmd(
         click.echo(f"Trades CSV:  {trades_path}")
 
 
+@main.command("dune-check")
+@click.pass_context
+def dune_check(ctx: click.Context) -> None:
+    """Verify DUNE_API_KEY (see docs/DUNE.md, .env.example)."""
+    dune_cfg = ctx.obj["cfg"].get("dune", {})
+    try:
+        with DuneClient() as client:
+            who = client.me()
+        click.echo("Dune API: OK")
+        click.echo(f"  MCP URL:  {dune_cfg.get('mcp_url', 'https://api.dune.com/mcp/v1')}")
+        click.echo(f"  REST:     {dune_cfg.get('api_base')}")
+        if isinstance(who, dict):
+            for k in ("username", "email", "name"):
+                if k in who:
+                    click.echo(f"  {k}: {who[k]}")
+    except Exception as e:
+        raise click.ClickException(str(e)) from e
+
+
 @main.command("sources")
 def sources() -> None:
     """List integrated open data sources."""
@@ -441,6 +461,10 @@ Open-source / public crypto data sources in this repo:
   3. CoinGecko API v3 (free public tier)
      Aggregated prices, OHLC, market cap rankings.
      https://www.coingecko.com/en/api
+
+  4. Dune Analytics (API key required)
+     On-chain SQL — set DUNE_API_KEY in .env, see docs/DUNE.md
+     Cursor MCP: config/cursor-mcp.example.json
 
 Raw files land under ./data/ (parquet or csv). Configure defaults in config/default.yaml.
 """

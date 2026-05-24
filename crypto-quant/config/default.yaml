@@ -1,6 +1,18 @@
 # Default paths (relative to repo root)
 data_dir: data
 
+# Dune Analytics — on-chain SQL (API key via env, never in this file)
+# Set DUNE_API_KEY in crypto-quant/.env (see .env.example, docs/DUNE.md)
+dune:
+  api_key_env: DUNE_API_KEY
+  api_base: https://api.dune.com/api/v1
+  mcp_url: https://api.dune.com/mcp/v1
+  default_chain: ethereum
+  sql_performance: small       # Dune tier: small | (omit for default)
+  sql_performance: small       # Dune tier for /sql/execute (free keys often: small only)
+  poll_interval_sec: 2
+  poll_timeout_sec: 300
+
 # CCXT live / incremental historical fetch
 ccxt:
   exchange: binanceusdm

@@ -13,6 +13,7 @@ Part of the [quantix-ventures](https://github.com/FrankDizheng/quantix-ventures)
 | [CCXT](https://github.com/ccxt/ccxt) | MIT, public REST | OHLCV, trades, funding rates |
 | [Binance Data Collection](https://data.binance.vision/) | Public archive | Bulk klines, aggTrades |
 | [CoinGecko API](https://www.coingecko.com/en/api) | Free tier | Aggregated prices, OHLC |
+| [Dune Analytics](https://dune.com) | API key (`DUNE_API_KEY`) | On-chain SQL — see [docs/DUNE.md](docs/DUNE.md) |
 
 ## Quick start
 
@@ -21,8 +22,10 @@ cd crypto-quant
 python -m venv .venv
 .venv\Scripts\activate          # Windows
 pip install -e .
+cp .env.example .env    # add DUNE_API_KEY for on-chain queries
 
 cq strategy-rules
+cq dune-check           # verify Dune key (optional)
 cq build-pool                     # liquidity filter + cost-zone tags
 cq backtest-batch                 # Ignition v3 on pool symbols
 cq backtest --symbol WIF/USDT:USDT
@@ -40,6 +43,7 @@ Output lands under `data/` (gitignored).
 | `cq build-pool` | Candidate pool with VWAP distance + stage |
 | `cq backtest` | Single-symbol Ignition backtest |
 | `cq backtest-batch` | Backtest all symbols in latest pool CSV |
+| `cq dune-check` | Verify `DUNE_API_KEY` |
 
 ## Project layout
 
