@@ -1,0 +1,83 @@
+# Default paths (relative to repo root)
+data_dir: data
+
+# CCXT live / incremental historical fetch
+ccxt:
+  exchange: binanceusdm
+  rate_limit_ms: 200
+  default_timeframe: 1h
+  default_symbols:
+    - BTC/USDT:USDT
+    - ETH/USDT:USDT
+
+# Binance public archive (data.binance.vision) — no API key
+binance_vision:
+  market: spot
+  data_type: klines
+  interval: 1h
+  symbols:
+    - BTCUSDT
+    - ETHUSDT
+
+# CoinGecko public API (free tier, no key)
+coingecko:
+  vs_currency: usd
+  coin_ids:
+    - bitcoin
+    - ethereum
+
+# Small-cap perpetual scan (see: cq scan-perps)
+scan:
+  exchanges:
+    - binanceusdm
+    - bybit
+    - okx
+    - gate
+    - bitget
+  min_quote_volume_usd: 500000
+  top_n: 20
+
+# Strategy: "Ignition" — small-cap momentum burst (exchange OHLCV only)
+strategy:
+  name: ignition
+  timeframe: 1h
+  # Binance USDT-M perpetual; change to any symbol you want to backtest
+  symbol: WIF/USDT:USDT
+  exchange: binanceusdm
+  lookback_days: 90
+  # --- v3: Donchian breakout entry + ATR stop + trailing exit ---
+  params:
+    breakout_hours: 48          # close > 48h high = ignition
+    vol_ma_hours: 20
+    vol_mult: 1.5               # need real volume confirmation
+    htf_trend_hours: 96         # 4d SMA, big-picture filter (0 to disable)
+    vwap_hours: 168             # cost-zone proxy: 7d VWAP
+    max_dist_to_cost_pct: 12.0  # don't chase if too far above VWAP; 0 disables
+    cooldown_bars: 12
+    # --- exits ---
+    atr_hours: 24
+    atr_stop_mult: 2.5          # initial stop = entry - 2.5 * ATR
+    trail_pct: 8.0              # trail = highest_close * (1 - 8%)
+    max_hold_hours: 168         # 7-day backstop time-stop
+  backtest:
+    initial_capital: 10000
+    fee_rate: 0.0004            # 0.04% per side (rough perp taker)
+    slippage_pct: 0.05          # 5 bps per side
+    position_fraction: 1.0
+
+# Candidate pool (cq build-pool)
+pool:
+  exchange: binanceusdm
+  timeframe: 1h
+  ohlcv_days: 21
+  min_quote_volume_usd: 1000000
+  max_quote_volume_usd: 80000000
+  max_candidates: 30       # before cost-zone ranking
+  final_top: 10            # after ranking
+  cost_zone:
+    vwap_hours: 168
+    box_hours: 168
+    box_k: 2.0
+    extended_pct: 15.0
+    accumulation_max_ret: 4.0
+    accumulation_max_dist: 3.0

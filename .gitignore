@@ -39,3 +39,11 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# crypto-quant (Python quant toolkit)
+crypto-quant/.venv/
+crypto-quant/data/
+crypto-quant/caches/
+crypto-quant/**/__pycache__/
+crypto-quant/**/*.egg-info/
+crypto-quant/.pytest_cache/
