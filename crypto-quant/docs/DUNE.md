@@ -58,9 +58,21 @@ Use the same key as `DUNE_API_KEY` in `.env` so Python and Cursor stay in sync.
 
 **Do not** put the live API key in this repository.
 
+## Wired into Ignition strategy
+
+When `strategy.dune.enabled: true` in `config/default.yaml`:
+
+1. Map the coin in `config/token_map.yaml` (chain + contract/mint address).
+2. `cq fetch-onchain --symbol PEPE/USDT:USDT` caches daily CEX netflow under `data/onchain/`.
+3. `cq backtest` / `cq backtest-batch` merge netflow onto each bar and **block entries** when
+   **7-day rolling net inflow to exchanges** exceeds `max_rolling_net_inflow_usd`
+   (large inflow ≈ potential distribution / sell pressure).
+
+SQL template: `queries/dune/exchange_netflow_daily.sql` (uses `cex.flows` on Dune).
+
 ## SQL queries in-repo
 
-Versioned query templates live under `queries/dune/`. Run them from Dune’s UI first, then wire results into `data/onchain/` via `cq fetch-onchain` (coming next).
+Versioned query templates live under `queries/dune/`. Run them from Dune’s UI first if the table name differs in your workspace.
 
 ## REST vs MCP
 

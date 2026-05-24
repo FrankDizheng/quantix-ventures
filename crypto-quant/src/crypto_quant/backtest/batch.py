@@ -16,6 +16,10 @@ from crypto_quant.backtest.report import (
 )
 from crypto_quant.data import CCXTFetcher
 from crypto_quant.data.storage import load_dataframe, save_dataframe
+from crypto_quant.onchain.netflow import (
+    DuneFilterConfig,
+    ensure_netflow_for_symbol,
+)
 from crypto_quant.strategy import IgnitionConfig, IgnitionStrategy
 
 
@@ -59,6 +63,7 @@ def run_batch(
     bt_cfg: BacktestConfig,
     out_root: Path,
     use_cache: bool = True,
+    dune_cfg: DuneFilterConfig | None = None,
     log: bool = True,
 ) -> BatchResult:
     rows: list[dict] = []
@@ -82,7 +87,25 @@ def run_batch(
                 print(f"[batch] {sym}: insufficient data ({len(df)} bars)")
             continue
 
-        signals = IgnitionStrategy(strat_cfg).generate_signals(df)
+        netflow = None
+        if dune_cfg and dune_cfg.enabled:
+            lookback = max(days, dune_cfg.lookback_days)
+            netflow = ensure_netflow_for_symbol(
+                sym,
+                out_root,
+                days=lookback,
+                use_cache=use_cache,
+            )
+            if netflow is None and not dune_cfg.skip_if_missing:
+                if log:
+                    print(f"[batch] {sym}: no token_map entry for Dune")
+                continue
+            if log and netflow is not None:
+                print(f"[batch] {sym}: Dune netflow {len(netflow)} days")
+
+        signals = IgnitionStrategy(strat_cfg, dune_cfg).generate_signals(
+            df, netflow_daily=netflow
+        )
         result = run_backtest(signals, strat_cfg=strat_cfg, bt_cfg=bt_cfg)
         eq = result.equity_curve["equity"]
         wins = sum(1 for t in result.trades if t.pnl_usd > 0)

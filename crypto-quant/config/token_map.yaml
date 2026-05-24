@@ -1,0 +1,28 @@
+# Map perpetual base symbol -> on-chain token for Dune netflow queries.
+# Add entries for symbols you backtest; missing symbols skip Dune filter if skip_if_missing=true.
+#
+# Find addresses: CoinGecko contract, Etherscan, or Dune dataset browser.
+
+PEPE:
+  chain: ethereum
+  address: "0x6982508145454Ce325ddbe47a25b4ec39f48a223"
+
+EIGEN:
+  chain: ethereum
+  address: "0xec6bff09baa4eaa89eb6ffb3aa575008b72b990d"
+
+WIF:
+  chain: solana
+  address: "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm"
+
+PENGU:
+  chain: solana
+  address: "2zMMhcVQEXDtdE6vsFS7S7D5oUodfJNH8BTsYRcTQgHH"
+
+PUMP:
+  chain: solana
+  address: "pumpCmXqMfrsAkQ5DB8K1A1d2Nqn8fq7w7E1d4Ypump"
+
+VIRTUAL:
+  chain: ethereum
+  address: "0x44ff19196a0c8f7e8b5a8c0d1e75eaf8b8b5e8c8"

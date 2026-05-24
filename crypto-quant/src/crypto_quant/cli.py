@@ -27,6 +27,11 @@ from crypto_quant.data.storage import load_dataframe
 from crypto_quant.pool import PoolConfig, build_pool
 from crypto_quant.scan import scan_exchanges
 from crypto_quant.scan.perp_scanner import ScanConfig, format_scan_table
+from crypto_quant.onchain.netflow import (
+    DuneFilterConfig,
+    ensure_netflow_for_symbol,
+    symbol_base,
+)
 from crypto_quant.strategy import CostZoneConfig, IgnitionConfig, IgnitionStrategy
 
 
@@ -184,6 +189,54 @@ def _ohlcv_cache_path(out: Path, exchange: str, timeframe: str, symbol: str) -> 
     return out / "ccxt" / exchange / timeframe / f"{safe}.parquet"
 
 
+def _dune_rules(sc: dict) -> str:
+    d = sc.get("dune", {})
+    if not d.get("enabled", False):
+        return "  - (Dune on-chain filter disabled)\n"
+    return (
+        f"  - Dune: 7d rolling CEX net inflow <= ${d.get('max_rolling_net_inflow_usd', 0):,.0f}\n"
+        f"    require_net_outflow={d.get('require_net_outflow', False)} "
+        f"(token_map.yaml + DUNE_API_KEY)\n"
+    )
+
+
+def _strategy_cfgs(sc: dict) -> tuple[IgnitionConfig, DuneFilterConfig | None]:
+    strat_cfg = IgnitionConfig.from_dict(sc.get("params", {}))
+    dune_cfg = DuneFilterConfig.from_dict(sc.get("dune", {}))
+    return strat_cfg, dune_cfg if dune_cfg.enabled else None
+
+
+@main.command("fetch-onchain")
+@click.option("--symbol", multiple=True, required=True, help="e.g. PEPE/USDT:USDT")
+@click.option("--days", default=None, type=int)
+@click.option("--fetch/--use-cache", "force_fetch", default=False)
+@click.pass_context
+def fetch_onchain_cmd(
+    ctx: click.Context,
+    symbol: tuple[str, ...],
+    days: int | None,
+    force_fetch: bool,
+) -> None:
+    """Fetch Dune daily CEX netflow for symbols in token_map.yaml."""
+    sc = ctx.obj["cfg"]["strategy"]
+    dune_cfg = DuneFilterConfig.from_dict(sc.get("dune", {}))
+    lookback = days or dune_cfg.lookback_days
+    out_root: Path = ctx.obj["out"]
+    for sym in symbol:
+        base = symbol_base(sym)
+        click.echo(f"Fetching on-chain netflow for {sym} ({base}, {lookback}d)...")
+        df = ensure_netflow_for_symbol(
+            sym,
+            out_root,
+            days=lookback,
+            use_cache=not force_fetch,
+        )
+        if df is None:
+            click.echo(f"  -> skip: no entry in config/token_map.yaml for {base}")
+            continue
+        click.echo(f"  -> {len(df)} days, latest net_inflow_usd={df['net_inflow_usd'].iloc[-1]:,.0f}")
+
+
 @main.command("strategy-rules")
 @click.pass_context
 def strategy_rules(ctx: click.Context) -> None:
@@ -212,6 +265,7 @@ ENTRY (all must be true on bar close, fresh trigger only):
   - Close > prior {p.get('breakout_hours', 48)}h HIGH (Donchian breakout)
   - Volume > {p.get('vol_mult')}x prior {p.get('vol_ma_hours')}h average
 {htf_line}{cost_line}  - Cooldown: {p.get('cooldown_bars', 0)} bars after previous exit
+{_dune_rules(sc)}
   -> Enter at NEXT bar OPEN with slippage (no lookahead)
 
 EXIT (binding stop = max of these two):
@@ -244,7 +298,7 @@ def backtest_cmd(
     symbol = symbol or sc["symbol"]
     timeframe = sc["timeframe"]
     lookback = days or sc.get("lookback_days", 90)
-    strat_cfg = IgnitionConfig.from_dict(sc.get("params", {}))
+    strat_cfg, dune_cfg = _strategy_cfgs(sc)
     bt_cfg = BacktestConfig(**sc.get("backtest", {}))
     out_root: Path = ctx.obj["out"]
     cache_path = _ohlcv_cache_path(out_root, exchange, timeframe, symbol)
@@ -264,12 +318,33 @@ def backtest_cmd(
         save_dataframe(df, cache_path)
         click.echo(f"Cached {len(df)} bars -> {cache_path}")
 
-    signals_df = IgnitionStrategy(strat_cfg).generate_signals(df)
+    netflow = None
+    if dune_cfg:
+        dune_days = max(lookback, dune_cfg.lookback_days)
+        click.echo(f"Loading Dune CEX netflow ({dune_days}d)...")
+        netflow = ensure_netflow_for_symbol(
+            symbol, out_root, days=dune_days, use_cache=use_cache
+        )
+        if netflow is None:
+            if dune_cfg.skip_if_missing:
+                click.echo(f"  -> no token_map for {symbol_base(symbol)}; Dune filter skipped")
+            else:
+                raise click.ClickException(f"No token_map entry for {symbol_base(symbol)}")
+        else:
+            click.echo(f"  -> {len(netflow)} daily on-chain rows")
+
+    signals_df = IgnitionStrategy(strat_cfg, dune_cfg).generate_signals(
+        df, netflow_daily=netflow
+    )
     n_signals = int(signals_df["entry_signal"].sum())
     n_triggers = int(signals_df["entry_trigger"].sum())
+    dune_blocked = 0
+    if dune_cfg and "net_inflow_roll_usd" in signals_df.columns:
+        raw = IgnitionStrategy(strat_cfg, None).generate_signals(df)
+        dune_blocked = int(raw["entry_trigger"].sum()) - n_triggers
     click.echo(
-        f"Signals: {n_signals} bars match conditions; "
-        f"{n_triggers} fresh triggers (of {len(signals_df)} bars)"
+        f"Signals: {n_signals} bars match; {n_triggers} triggers "
+        f"(dune blocked ~{max(dune_blocked, 0)} prior triggers, of {len(signals_df)} bars)"
     )
 
     result = run_backtest(signals_df, strat_cfg=strat_cfg, bt_cfg=bt_cfg)
@@ -380,9 +455,11 @@ def backtest_batch_cmd(
     exchange = exchange or sc["exchange"]
     timeframe = sc["timeframe"]
     lookback = days or sc.get("lookback_days", 90)
-    strat_cfg = IgnitionConfig.from_dict(sc.get("params", {}))
+    strat_cfg, dune_cfg = _strategy_cfgs(sc)
     bt_cfg = BacktestConfig(**sc.get("backtest", {}))
     out_root: Path = ctx.obj["out"]
+    if dune_cfg:
+        click.echo("Dune on-chain filter: enabled")
 
     if extra_symbols:
         symbols = list(extra_symbols)
@@ -407,6 +484,7 @@ def backtest_batch_cmd(
         bt_cfg=bt_cfg,
         out_root=out_root,
         use_cache=use_cache,
+        dune_cfg=dune_cfg,
     )
 
     click.echo("")

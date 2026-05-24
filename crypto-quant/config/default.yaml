@@ -8,8 +8,7 @@ dune:
   api_base: https://api.dune.com/api/v1
   mcp_url: https://api.dune.com/mcp/v1
   default_chain: ethereum
-  sql_performance: small       # Dune tier: small | (omit for default)
-  sql_performance: small       # Dune tier for /sql/execute (free keys often: small only)
+  sql_performance: small
   poll_interval_sec: 2
   poll_timeout_sec: 300
 
@@ -71,6 +70,14 @@ strategy:
     atr_stop_mult: 2.5          # initial stop = entry - 2.5 * ATR
     trail_pct: 8.0              # trail = highest_close * (1 - 8%)
     max_hold_hours: 168         # 7-day backstop time-stop
+  # Dune on-chain filter (requires token_map.yaml + DUNE_API_KEY)
+  dune:
+    enabled: true
+    lookback_days: 90
+    rolling_days: 7
+    max_rolling_net_inflow_usd: 2000000   # skip if 7d net CEX inflow above this
+    require_net_outflow: false            # true = only when net leaving exchanges
+    skip_if_missing: true                  # no token_map entry -> ignore Dune filter
   backtest:
     initial_capital: 10000
     fee_rate: 0.0004            # 0.04% per side (rough perp taker)

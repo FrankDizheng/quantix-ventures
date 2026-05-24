@@ -33,6 +33,11 @@ from dataclasses import dataclass
 
 import pandas as pd
 
+from crypto_quant.onchain.netflow import (
+    DuneFilterConfig,
+    apply_dune_entry_filter,
+    merge_netflow_to_ohlcv,
+)
 from crypto_quant.strategy.cost_zone import CostZoneConfig, add_cost_zone
 
 
@@ -102,10 +107,20 @@ def add_indicators(df: pd.DataFrame, cfg: IgnitionConfig) -> pd.DataFrame:
 
 
 class IgnitionStrategy:
-    def __init__(self, cfg: IgnitionConfig | None = None) -> None:
+    def __init__(
+        self,
+        cfg: IgnitionConfig | None = None,
+        dune_cfg: DuneFilterConfig | None = None,
+    ) -> None:
         self.cfg = cfg or IgnitionConfig()
+        self.dune_cfg = dune_cfg
 
-    def generate_signals(self, df: pd.DataFrame) -> pd.DataFrame:
+    def generate_signals(
+        self,
+        df: pd.DataFrame,
+        *,
+        netflow_daily: pd.DataFrame | None = None,
+    ) -> pd.DataFrame:
         cfg = self.cfg
         min_bars = (
             max(
@@ -124,6 +139,12 @@ class IgnitionStrategy:
             return out
 
         x = add_indicators(df, cfg)
+        if self.dune_cfg and self.dune_cfg.enabled:
+            x = merge_netflow_to_ohlcv(
+                x,
+                netflow_daily,
+                rolling_days=self.dune_cfg.rolling_days,
+            )
         cond = (
             (x["close"] > x["breakout_level"])
             & (x["volume"] > x["vol_ma"] * cfg.vol_mult)
@@ -139,6 +160,8 @@ class IgnitionStrategy:
                 & x["dist_to_cost_pct"].notna()
                 & (x["dist_to_cost_pct"] <= cfg.max_dist_to_cost_pct)
             )
+        if self.dune_cfg and self.dune_cfg.enabled:
+            cond = apply_dune_entry_filter(cond, x, self.dune_cfg)
 
         x["entry_signal"] = cond.fillna(False).astype(bool)
         x["entry_trigger"] = x["entry_signal"] & ~x["entry_signal"].shift(
