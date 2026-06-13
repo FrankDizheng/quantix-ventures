@@ -1,14 +1,18 @@
 # Map perpetual base symbol -> on-chain token for Dune netflow queries.
-# Add entries for symbols you backtest; missing symbols skip Dune filter if skip_if_missing=true.
+# cex.flows currently covers EVM chains only (ethereum, base, arbitrum, ...).
+# Solana entries will return empty netflow until Dune adds solana to cex.flows.
 #
-# Find addresses: CoinGecko contract, Etherscan, or Dune dataset browser.
+# token_symbol: preferred filter for cex.flows (most reliable on EVM).
+# address: fallback / required for address-only matching.
 
 PEPE:
   chain: ethereum
+  token_symbol: PEPE
   address: "0x6982508145454Ce325ddbe47a25b4ec39f48a223"
 
 EIGEN:
   chain: ethereum
+  token_symbol: EIGEN
   address: "0xec6bff09baa4eaa89eb6ffb3aa575008b72b990d"
 
 WIF:
@@ -25,4 +29,5 @@ PUMP:
 
 VIRTUAL:
   chain: ethereum
+  token_symbol: VIRTUAL
   address: "0x44ff19196a0c8f7e8b5a8c0d1e75eaf8b8b5e8c8"

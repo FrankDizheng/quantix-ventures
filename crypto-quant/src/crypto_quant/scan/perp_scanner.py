@@ -14,6 +14,8 @@ from typing import Any
 import ccxt
 import pandas as pd
 
+from crypto_quant.data.ticker_utils import quote_volume_usd
+
 # Large caps — excluded from "small coin" universe
 MAJOR_BASES = frozenset(
     {
@@ -110,7 +112,7 @@ class PerpScanner:
             t = tickers.get(sym)
             if not t:
                 continue
-            qv = float(t.get("quoteVolume") or 0)
+            qv = quote_volume_usd(t)
             if qv < cfg.min_quote_volume_usd or qv > cfg.max_quote_volume_usd:
                 continue
             pct = t.get("percentage")

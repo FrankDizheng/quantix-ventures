@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -14,8 +13,7 @@ from crypto_quant.backtest.report import (
     buy_and_hold_pct,
     max_drawdown_pct,
 )
-from crypto_quant.data import CCXTFetcher
-from crypto_quant.data.storage import load_dataframe, save_dataframe
+from crypto_quant.data.sync import SyncConfig, ensure_ohlcv, ohlcv_cache_path
 from crypto_quant.onchain.netflow import (
     DuneFilterConfig,
     ensure_netflow_for_symbol,
@@ -29,11 +27,6 @@ class BatchResult:
     trades: pd.DataFrame
 
 
-def _ohlcv_path(out_root: Path, exchange: str, timeframe: str, symbol: str) -> Path:
-    safe = symbol.replace("/", "_").replace(":", "_")
-    return out_root / "ccxt" / exchange / timeframe / f"{safe}.parquet"
-
-
 def _ensure_ohlcv(
     out_root: Path,
     *,
@@ -42,15 +35,27 @@ def _ensure_ohlcv(
     symbol: str,
     days: int,
     use_cache: bool,
+    max_stale_hours: float = 24.0,
 ) -> pd.DataFrame:
-    path = _ohlcv_path(out_root, exchange, timeframe, symbol)
-    if use_cache and path.exists():
-        return load_dataframe(path)
-    since = datetime.now(timezone.utc) - timedelta(days=days)
-    df = CCXTFetcher(exchange, rate_limit_ms=200).fetch_ohlcv(symbol, timeframe, since=since)
-    if not df.empty:
-        save_dataframe(df, path)
-    return df
+    if use_cache:
+        return ensure_ohlcv(
+            out_root,
+            exchange=exchange,
+            timeframe=timeframe,
+            symbol=symbol,
+            days=days,
+            max_stale_hours=max_stale_hours,
+            force=False,
+        )
+    return ensure_ohlcv(
+        out_root,
+        exchange=exchange,
+        timeframe=timeframe,
+        symbol=symbol,
+        days=days,
+        max_stale_hours=max_stale_hours,
+        force=True,
+    )
 
 
 def run_batch(
@@ -65,6 +70,7 @@ def run_batch(
     use_cache: bool = True,
     dune_cfg: DuneFilterConfig | None = None,
     log: bool = True,
+    max_stale_hours: float = 24.0,
 ) -> BatchResult:
     rows: list[dict] = []
     all_trades: list[dict] = []
@@ -77,6 +83,7 @@ def run_batch(
                 symbol=sym,
                 days=days,
                 use_cache=use_cache,
+                max_stale_hours=max_stale_hours,
             )
         except Exception as e:
             if log:

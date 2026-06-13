@@ -21,6 +21,7 @@ from typing import Any
 import pandas as pd
 
 from crypto_quant.data import CCXTFetcher
+from crypto_quant.data.ticker_utils import quote_volume_usd
 from crypto_quant.scan.perp_scanner import MAJOR_BASES
 from crypto_quant.strategy.cost_zone import CostZoneConfig, latest_snapshot
 
@@ -80,7 +81,7 @@ def _list_candidate_symbols(fetcher: CCXTFetcher, cfg: PoolConfig) -> list[tuple
         t = tickers.get(sym)
         if not t:
             continue
-        qv = float(t.get("quoteVolume") or 0)
+        qv = quote_volume_usd(t)
         if qv < cfg.min_quote_volume_usd or qv > cfg.max_quote_volume_usd:
             continue
         rows.append((sym, qv))

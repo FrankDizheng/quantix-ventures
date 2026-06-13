@@ -51,6 +51,13 @@ class IgnitionConfig:
     vwap_hours: int = 168              # 7-day VWAP for cost-zone filter
     max_dist_to_cost_pct: float = 12.0 # 0 disables
     cooldown_bars: int = 12
+    # Gate-1 path-A additions:
+    max_dist_to_breakout_pct: float = 0.0  # 0 disables; e.g. 3.0 = skip if
+                                            # close > breakout_level * 1.03
+                                            # (i.e. breakout has already
+                                            # extended — bad fill, weak R/R)
+    require_btc_uptrend: bool = False  # only enter when BTC > BTC EMA
+                                        # (caller passes btc_trend series)
 
     # --- risk / exit ---
     atr_hours: int = 24                # ATR window
@@ -120,6 +127,7 @@ class IgnitionStrategy:
         df: pd.DataFrame,
         *,
         netflow_daily: pd.DataFrame | None = None,
+        btc_trend: pd.Series | None = None,
     ) -> pd.DataFrame:
         cfg = self.cfg
         min_bars = (
@@ -160,6 +168,15 @@ class IgnitionStrategy:
                 & x["dist_to_cost_pct"].notna()
                 & (x["dist_to_cost_pct"] <= cfg.max_dist_to_cost_pct)
             )
+        if cfg.max_dist_to_breakout_pct > 0:
+            # Skip "extended" breakouts where price has already run too far
+            # past the breakout level — these have worse R/R because
+            # the initial ATR stop is now further away.
+            dist_to_bk = (x["close"] / x["breakout_level"] - 1) * 100
+            cond = cond & (dist_to_bk <= cfg.max_dist_to_breakout_pct)
+        if cfg.require_btc_uptrend and btc_trend is not None:
+            aligned = btc_trend.reindex(x["timestamp"]).fillna(False).to_numpy()
+            cond = cond & aligned
         if self.dune_cfg and self.dune_cfg.enabled:
             cond = apply_dune_entry_filter(cond, x, self.dune_cfg)
 
@@ -167,4 +184,11 @@ class IgnitionStrategy:
         x["entry_trigger"] = x["entry_signal"] & ~x["entry_signal"].shift(
             1, fill_value=False
         )
+        # Signal strength for portfolio tie-breaking:
+        # excess over breakout, normalised by ATR. Higher = stronger breakout.
+        # NaN-safe: only meaningful where entry_trigger is True.
+        atr_safe = x["atr"].replace(0, pd.NA)
+        x["entry_strength"] = (
+            (x["close"] - x["breakout_level"]) / atr_safe
+        ).fillna(0.0)
         return x

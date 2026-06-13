@@ -14,9 +14,23 @@ def repo_root() -> Path:
 
 
 def load_config(path: Path | None = None) -> dict[str, Any]:
+    _load_dotenv()
     cfg_path = path or _DEFAULT_CONFIG
     with cfg_path.open(encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
+
+
+def _load_dotenv() -> None:
+    """Load crypto-quant/.env if present (never committed)."""
+    env_path = _REPO_ROOT / ".env"
+    if not env_path.exists():
+        return
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv(env_path, override=False)
+    except ImportError:
+        pass
 
 
 def data_dir(cfg: dict[str, Any] | None = None) -> Path:

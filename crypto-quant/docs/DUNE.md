@@ -21,7 +21,7 @@ If a key was pasted into chat or committed by mistake, **rotate it** in Dune set
 
 ```powershell
 cd crypto-quant
-$env:DUNE_API_KEY = "your_key"   # or use .env + python-dotenv later
+$env:DUNE_API_KEY = "your_key"   # or copy .env.example -> .env (auto-loaded)
 cq dune-check                    # verify key works
 ```
 
@@ -69,6 +69,8 @@ When `strategy.dune.enabled: true` in `config/default.yaml`:
    (large inflow ≈ potential distribution / sell pressure).
 
 SQL template: `queries/dune/exchange_netflow_daily.sql` (uses `cex.flows` on Dune).
+
+**Supported chains:** `cex.flows` is EVM-only today (ethereum, base, arbitrum, polygon, …). Solana tokens in `token_map.yaml` will fetch empty netflow until Dune indexes Solana CEX flows.
 
 ## SQL queries in-repo
 

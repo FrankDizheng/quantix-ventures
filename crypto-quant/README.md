@@ -20,18 +20,22 @@ Part of the [quantix-ventures](https://github.com/FrankDizheng/quantix-ventures)
 ```bash
 cd crypto-quant
 python -m venv .venv
-.venv\Scripts\activate          # Windows
+source .venv/bin/activate      # macOS/Linux
 pip install -e .
-cp .env.example .env    # add DUNE_API_KEY for on-chain queries
+cp .env.example .env           # add DUNE_API_KEY for on-chain queries
 
-cq strategy-rules
-cq dune-check           # verify Dune key (optional)
-cq build-pool                     # liquidity filter + cost-zone tags
-cq backtest-batch                 # Ignition v3 on pool symbols
-cq backtest --symbol WIF/USDT:USDT
+cq build-pool                  # scan universe (network, ~30s)
+cq sync-data                   # download OHLCV + Dune → data/ (network, once)
+cq backtest-batch              # read local cache only (~seconds)
 ```
 
-Output lands under `data/` (gitignored).
+**You do not need to manually fetch before every backtest.** Data lands in `data/` (gitignored). Re-run `cq sync-data` once per day (or let backtest auto-refresh stale cache).
+
+```bash
+cq strategy-rules
+cq dune-check                  # verify Dune key (optional)
+cq backtest --symbol PEPE/USDT:USDT
+```
 
 ## CLI commands
 
@@ -41,6 +45,7 @@ Output lands under `data/` (gitignored).
 | `cq fetch-binance-vision` | Bulk historical klines |
 | `cq scan-perps` | Multi-exchange small-cap perpetual scan |
 | `cq build-pool` | Candidate pool with VWAP distance + stage |
+| `cq sync-data` | Sync OHLCV + Dune netflow to local `data/` |
 | `cq backtest` | Single-symbol Ignition backtest |
 | `cq backtest-batch` | Backtest all symbols in latest pool CSV |
 | `cq dune-check` | Verify `DUNE_API_KEY` |

@@ -54,18 +54,39 @@ def netflow_cache_path(
     return out_root / "onchain" / chain / f"{safe}_netflow_{days}d.parquet"
 
 
-def _render_sql(chain: str, address: str, days: int) -> str:
+def _token_filter_clause(
+    chain: str,
+    address: str,
+    *,
+    token_symbol: str | None = None,
+) -> str:
+    """Build a WHERE fragment for cex.flows token matching."""
+    if token_symbol:
+        safe = token_symbol.replace("'", "''")
+        return f"token_symbol = '{safe}'"
+    if chain == "solana":
+        safe = address.replace("'", "''")
+        return f"cast(token_address as varchar) = '{safe}'"
+    addr = address if address.startswith("0x") else f"0x{address}"
+    safe = addr.replace("'", "''")
+    return f"lower(cast(token_address as varchar)) = lower('{safe}')"
+
+
+def _render_sql(
+    chain: str,
+    address: str,
+    days: int,
+    *,
+    token_symbol: str | None = None,
+) -> str:
     sql_path = repo_root() / "queries" / "dune" / "exchange_netflow_daily.sql"
     tpl = DuneClient.load_sql(sql_path)
-    if address.startswith("0x"):
-        addr = address
-    elif chain in ("ethereum", "base", "arbitrum", "polygon"):
-        addr = address if address.startswith("0x") else f"0x{address}"
-    else:
-        addr = f"'{address}'"
+    token_filter = _token_filter_clause(
+        chain, address, token_symbol=token_symbol
+    )
     return (
         tpl.replace("{{CHAIN}}", chain)
-        .replace("{{TOKEN_ADDRESS}}", addr)
+        .replace("{{TOKEN_FILTER}}", token_filter)
         .replace("{{DAYS}}", str(int(days)))
     )
 
@@ -74,12 +95,16 @@ def fetch_netflow_daily(
     chain: str,
     address: str,
     days: int,
+    *,
+    token_symbol: str | None = None,
 ) -> pd.DataFrame:
-    sql = _render_sql(chain, address, days)
+    sql = _render_sql(chain, address, days, token_symbol=token_symbol)
     with DuneClient() as client:
         df = client.execute_sql(sql)
     if df.empty:
-        return df
+        return pd.DataFrame(
+            columns=["day", "inflow_usd", "outflow_usd", "net_inflow_usd"]
+        )
     df["day"] = pd.to_datetime(df["day"], utc=True).dt.normalize()
     for col in ("inflow_usd", "outflow_usd", "net_inflow_usd"):
         if col in df.columns:
@@ -103,10 +128,13 @@ def ensure_netflow_for_symbol(
         return None
     chain = meta.get("chain", "ethereum")
     address = meta["address"]
+    token_symbol = meta.get("token_symbol") or meta.get("symbol")
     path = netflow_cache_path(out_root, chain, address, days)
     if use_cache and path.exists():
         return load_dataframe(path)
-    df = fetch_netflow_daily(chain, address, days)
+    df = fetch_netflow_daily(
+        chain, address, days, token_symbol=token_symbol
+    )
     if not df.empty:
         save_dataframe(df, path)
     return df
@@ -156,7 +184,13 @@ def apply_dune_entry_filter(
         return cond & False
 
     roll = df["net_inflow_roll_usd"]
-    ok = roll.notna() & (roll <= dune_cfg.max_rolling_net_inflow_usd)
+    if roll.notna().sum() == 0:
+        if dune_cfg.skip_if_missing:
+            return cond
+        return cond & False
+
+    # Bars without on-chain data pass through; mapped symbols filter when data exists.
+    ok = roll.isna() | (roll <= dune_cfg.max_rolling_net_inflow_usd)
     if dune_cfg.require_net_outflow:
-        ok = ok & (roll < 0)
+        ok = ok & (roll.isna() | (roll < 0))
     return cond & ok

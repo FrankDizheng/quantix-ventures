@@ -24,3 +24,20 @@ def test_merge_and_filter() -> None:
     cond = pd.Series([True] * len(merged))
     filtered = apply_dune_entry_filter(cond, merged, DuneFilterConfig(max_rolling_net_inflow_usd=3_000_000))
     assert filtered.sum() < len(filtered)
+    assert filtered.sum() > 0
+
+
+def test_dune_skip_when_netflow_missing() -> None:
+    ohlcv = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=48, freq="h", tz="UTC"),
+            "close": [1.0] * 48,
+            "volume": [100.0] * 48,
+        }
+    )
+    merged = merge_netflow_to_ohlcv(ohlcv, None, rolling_days=7)
+    cond = pd.Series([True] * len(merged))
+    filtered = apply_dune_entry_filter(
+        cond, merged, DuneFilterConfig(skip_if_missing=True)
+    )
+    assert filtered.sum() == len(filtered)

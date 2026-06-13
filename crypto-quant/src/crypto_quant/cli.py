@@ -24,6 +24,7 @@ from crypto_quant.backtest import (
     run_batch,
 )
 from crypto_quant.data.storage import load_dataframe
+from crypto_quant.pairs import PairResearchConfig, format_pair_report, rank_pairs
 from crypto_quant.pool import PoolConfig, build_pool
 from crypto_quant.scan import scan_exchanges
 from crypto_quant.scan.perp_scanner import ScanConfig, format_scan_table
@@ -32,7 +33,13 @@ from crypto_quant.onchain.netflow import (
     ensure_netflow_for_symbol,
     symbol_base,
 )
-from crypto_quant.strategy import CostZoneConfig, IgnitionConfig, IgnitionStrategy
+from crypto_quant.strategy import (
+    CostZoneConfig,
+    FundingCarryConfig,
+    IgnitionConfig,
+    IgnitionStrategy,
+    MeanReversionConfig,
+)
 
 
 @click.group()
@@ -184,9 +191,14 @@ def scan_perps(
         click.echo(f"\nSaved {path}")
 
 
-def _ohlcv_cache_path(out: Path, exchange: str, timeframe: str, symbol: str) -> Path:
-    safe = symbol.replace("/", "_").replace(":", "_")
-    return out / "ccxt" / exchange / timeframe / f"{safe}.parquet"
+from crypto_quant.data.sync import (
+    SyncConfig,
+    ensure_ohlcv,
+    ohlcv_cache_path,
+    resolve_pool_symbols,
+    resolve_token_map_symbols,
+    sync_symbols,
+)
 
 
 def _dune_rules(sc: dict) -> str:
@@ -234,6 +246,9 @@ def fetch_onchain_cmd(
         if df is None:
             click.echo(f"  -> skip: no entry in config/token_map.yaml for {base}")
             continue
+        if df.empty:
+            click.echo(f"  -> 0 days (no CEX flow rows in lookback window)")
+            continue
         click.echo(f"  -> {len(df)} days, latest net_inflow_usd={df['net_inflow_usd'].iloc[-1]:,.0f}")
 
 
@@ -279,6 +294,72 @@ Edit params in config/default.yaml under strategy.params
     )
 
 
+@main.command("sync-data")
+@click.option(
+    "--source",
+    type=click.Choice(["pool", "token-map", "symbols"]),
+    default="pool",
+    help="pool=latest pool CSV; token-map=mapped EVM symbols; symbols=--symbol list",
+)
+@click.option("--symbol", "symbols", multiple=True, help="With --source symbols")
+@click.option("--exchange", default=None)
+@click.option("--days", default=None, type=int)
+@click.option("--force", is_flag=True, help="Re-download even if cache is fresh")
+@click.pass_context
+def sync_data_cmd(
+    ctx: click.Context,
+    source: str,
+    symbols: tuple[str, ...],
+    exchange: str | None,
+    days: int | None,
+    force: bool,
+) -> None:
+    """Sync OHLCV + Dune netflow to local data/ (run once daily, backtests stay fast)."""
+    cfg = ctx.obj["cfg"]
+    sync_cfg = SyncConfig.from_cfg(cfg)
+    exchange = exchange or sync_cfg.exchange
+    lookback = days or sync_cfg.lookback_days
+    out_root: Path = ctx.obj["out"]
+
+    if source == "pool":
+        syms = resolve_pool_symbols(out_root, exchange)
+        if not syms:
+            raise click.ClickException(
+                "No pool CSV found. Run `cq build-pool` first or use --source symbols."
+            )
+        click.echo(f"Syncing {len(syms)} symbols from pool ({exchange})...")
+    elif source == "token-map":
+        syms = resolve_token_map_symbols()
+        click.echo(f"Syncing {len(syms)} token_map symbols...")
+    else:
+        if not symbols:
+            sc = cfg.get("strategy", {})
+            syms = [sc.get("symbol", "PEPE/USDT:USDT")]
+        else:
+            syms = list(symbols)
+        click.echo(f"Syncing {len(syms)} explicit symbols...")
+
+    result = sync_symbols(
+        syms,
+        out_root=out_root,
+        exchange=exchange,
+        timeframe=sync_cfg.timeframe,
+        days=lookback,
+        dune_days=sync_cfg.dune_lookback_days,
+        dune_enabled=sync_cfg.dune_enabled,
+        max_stale_hours=sync_cfg.max_stale_hours,
+        force=force,
+    )
+    click.echo(
+        f"\nDone: ohlcv fetched={len(result.ohlcv_fetched)} cached={len(result.ohlcv_skipped)} "
+        f"| dune fetched={len(result.onchain_fetched)} cached={len(result.onchain_skipped)}"
+    )
+    if result.errors:
+        click.echo(f"Errors ({len(result.errors)}):")
+        for e in result.errors[:5]:
+            click.echo(f"  - {e}")
+
+
 @main.command("backtest")
 @click.option("--symbol", default=None, help="e.g. WIF/USDT:USDT")
 @click.option("--exchange", default=None)
@@ -301,21 +382,41 @@ def backtest_cmd(
     strat_cfg, dune_cfg = _strategy_cfgs(sc)
     bt_cfg = BacktestConfig(**sc.get("backtest", {}))
     out_root: Path = ctx.obj["out"]
-    cache_path = _ohlcv_cache_path(out_root, exchange, timeframe, symbol)
+    cache_path = ohlcv_cache_path(out_root, exchange, timeframe, symbol)
+
+    sync_cfg = SyncConfig.from_cfg(ctx.obj["cfg"])
+    max_stale = sync_cfg.max_stale_hours
 
     df = None
-    if use_cache and cache_path.exists():
-        click.echo(f"Loading cache {cache_path}")
-        df = load_dataframe(cache_path)
+    if use_cache:
+        from crypto_quant.data.sync import cache_status, _timeframe_hours
+
+        min_bars = int(lookback * 24 / _timeframe_hours(timeframe) * 0.9)
+        needs, reason = cache_status(
+            cache_path, min_bars=min_bars, max_stale_hours=max_stale
+        )
+        if not needs:
+            click.echo(f"Loading cache {cache_path}")
+            df = load_dataframe(cache_path)
+        elif cache_path.exists():
+            click.echo(f"Cache {reason}, refreshing...")
 
     if df is None or df.empty:
-        click.echo(f"Fetching {symbol} {timeframe} ({lookback}d) from {exchange}...")
-        since = datetime.now(timezone.utc) - timedelta(days=lookback)
-        fetcher = CCXTFetcher(exchange, rate_limit_ms=200)
-        df = fetcher.fetch_ohlcv(symbol, timeframe, since=since)
+        if use_cache and not cache_path.exists():
+            click.echo(f"No cache — fetching {symbol} {timeframe} ({lookback}d)...")
+        elif not use_cache:
+            click.echo(f"Fetching {symbol} {timeframe} ({lookback}d) from {exchange}...")
+        df = ensure_ohlcv(
+            out_root,
+            exchange=exchange,
+            timeframe=timeframe,
+            symbol=symbol,
+            days=lookback,
+            max_stale_hours=max_stale,
+            force=not use_cache or df is None,
+        )
         if df.empty:
             raise click.ClickException(f"No data for {symbol} on {exchange}")
-        save_dataframe(df, cache_path)
         click.echo(f"Cached {len(df)} bars -> {cache_path}")
 
     netflow = None
@@ -435,6 +536,96 @@ def _resolve_pool_csv(out_root: Path, exchange: str) -> Path | None:
     return candidates[-1] if candidates else None
 
 
+@main.command("research-pairs")
+@click.option("--pool", "pool_path", type=click.Path(path_type=Path), default=None)
+@click.option("--exchange", default=None)
+@click.option("--symbol", "extra_symbols", multiple=True, help="Override pool with explicit symbols")
+@click.option("--days", default=None, type=int, help="OHLCV days to load/fetch")
+@click.option("--lookback-hours", default=720, type=int)
+@click.option("--min-overlap", default=240, type=int)
+@click.option("--min-corr", default=0.55, type=float)
+@click.option("--z-window", default=120, type=int)
+@click.option("--entry-z", default=2.0, type=float)
+@click.option("--top", default=10, type=int)
+@click.option("--use-cache/--fetch", default=True)
+@click.pass_context
+def research_pairs_cmd(
+    ctx: click.Context,
+    pool_path: Path | None,
+    exchange: str | None,
+    extra_symbols: tuple[str, ...],
+    days: int | None,
+    lookback_hours: int,
+    min_overlap: int,
+    min_corr: float,
+    z_window: int,
+    entry_z: float,
+    top: int,
+    use_cache: bool,
+) -> None:
+    """Rank small-cap perp pairs by spread mean-reversion patterns."""
+    sc = ctx.obj["cfg"]["strategy"]
+    exchange = exchange or sc["exchange"]
+    timeframe = sc["timeframe"]
+    lookback_days = days or max(sc.get("lookback_days", 90), int(lookback_hours / 24) + 7)
+    out_root: Path = ctx.obj["out"]
+
+    if extra_symbols:
+        symbols = list(extra_symbols)
+        click.echo(f"Using {len(symbols)} symbols from --symbol")
+    else:
+        path = pool_path or _resolve_pool_csv(out_root, exchange)
+        if path is None or not path.exists():
+            raise click.ClickException(
+                "No pool CSV found. Run `cq build-pool` first or pass --symbol."
+            )
+        click.echo(f"Loading pool: {path}")
+        symbols = pd.read_csv(path)["symbol"].dropna().astype(str).tolist()
+
+    if len(symbols) < 2:
+        raise click.ClickException("Need at least two symbols for pair research.")
+
+    sync_cfg = SyncConfig.from_cfg(ctx.obj["cfg"])
+    ohlcv_by_symbol: dict[str, pd.DataFrame] = {}
+    for sym in symbols:
+        try:
+            df = ensure_ohlcv(
+                out_root,
+                exchange=exchange,
+                timeframe=timeframe,
+                symbol=sym,
+                days=lookback_days,
+                max_stale_hours=sync_cfg.max_stale_hours,
+                force=not use_cache,
+            )
+            if not df.empty:
+                ohlcv_by_symbol[sym] = df
+                click.echo(f"[pair] {sym}: {len(df)} bars")
+        except Exception as e:
+            click.echo(f"[pair] {sym}: skip ({e})")
+
+    cfg = PairResearchConfig(
+        lookback_hours=lookback_hours,
+        min_overlap=min_overlap,
+        min_corr=min_corr,
+        z_window=z_window,
+        entry_z=entry_z,
+    )
+    ranked = rank_pairs(ohlcv_by_symbol, cfg)
+    click.echo("")
+    click.echo(format_pair_report(ranked, top=top))
+
+    out_dir = out_root / "pairs"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
+    path = out_dir / f"pairs_{exchange}_{ts}.csv"
+    latest = out_dir / f"pairs_{exchange}_latest.csv"
+    save_dataframe(ranked, path, format="csv")
+    save_dataframe(ranked, latest, format="csv")
+    click.echo(f"\nSaved pairs: {path}")
+    click.echo(f"Latest:      {latest}")
+
+
 @main.command("backtest-batch")
 @click.option("--pool", "pool_path", type=click.Path(path_type=Path), default=None)
 @click.option("--exchange", default=None)
@@ -485,6 +676,7 @@ def backtest_batch_cmd(
         out_root=out_root,
         use_cache=use_cache,
         dune_cfg=dune_cfg,
+        max_stale_hours=SyncConfig.from_cfg(ctx.obj["cfg"]).max_stale_hours,
     )
 
     click.echo("")
@@ -500,6 +692,502 @@ def backtest_batch_cmd(
         trades_path = report_dir / f"batch_{exchange}_{ts}_trades.csv"
         save_dataframe(result.trades, trades_path, format="csv")
         click.echo(f"Trades CSV:  {trades_path}")
+
+
+@main.command("backtest-honest")
+@click.option("--exchange", default=None)
+@click.option("--days", default=90, type=int, help="Total history days (IS + OOS)")
+@click.option(
+    "--oos-days", default=30, type=int, help="Hold out last N days as out-of-sample"
+)
+@click.option(
+    "--position-fraction",
+    default=0.25,
+    type=float,
+    help="Fraction of equity per trade (0.25 = 25%)",
+)
+@click.option(
+    "--slippage-pct",
+    default=0.15,
+    type=float,
+    help="Per-side slippage incl spread (small-cap perps: 0.10-0.30)",
+)
+@click.option(
+    "--funding-per-8h-pct",
+    default=0.03,
+    type=float,
+    help="Perp funding rate per 8h, longs pay (0.03 = ~33%/yr)",
+)
+@click.option(
+    "--source",
+    type=click.Choice(["pool", "symbols"]),
+    default="pool",
+)
+@click.option("--symbol", "extra_symbols", multiple=True)
+@click.option("--no-dune", is_flag=True, help="Force Dune filter off")
+@click.option(
+    "--btc-regime",
+    is_flag=True,
+    help="Only enter when BTC > EMA(168) — regime filter",
+)
+@click.option(
+    "--max-dist-breakout",
+    default=None,
+    type=float,
+    help="Skip extended breakouts (close > breakout_level*(1+x%)). e.g. 3.0",
+)
+@click.option(
+    "--time-stop-hours",
+    default=None,
+    type=int,
+    help="Override max_hold_hours (smaller = cut losers faster)",
+)
+@click.option(
+    "--trail-pct",
+    default=None,
+    type=float,
+    help="Override trailing stop %% (larger = let winners run further)",
+)
+@click.option(
+    "--atr-stop-mult",
+    default=None,
+    type=float,
+    help="Override initial ATR stop multiplier",
+)
+@click.option(
+    "--strategy",
+    "strategy_name",
+    type=click.Choice(["ignition", "mean_reversion", "funding_carry"]),
+    default="ignition",
+    help="Which strategy to backtest",
+)
+@click.option(
+    "--tag",
+    default=None,
+    type=str,
+    help="Label for output filenames (e.g. baseline, btc, combo)",
+)
+@click.pass_context
+def backtest_honest_cmd(
+    ctx: click.Context,
+    exchange: str | None,
+    days: int,
+    oos_days: int,
+    position_fraction: float,
+    slippage_pct: float,
+    funding_per_8h_pct: float,
+    source: str,
+    extra_symbols: tuple[str, ...],
+    no_dune: bool,
+    btc_regime: bool,
+    max_dist_breakout: float | None,
+    time_stop_hours: int | None,
+    trail_pct: float | None,
+    atr_stop_mult: float | None,
+    strategy_name: str,
+    tag: str | None,
+) -> None:
+    """Gate 1: out-of-sample walk-forward backtest with realistic costs.
+
+    Pass criteria: OOS edge > 0, ≥ 50 trades total, max DD < 30%.
+    """
+    sc = ctx.obj["cfg"]["strategy"]
+    exchange = exchange or sc["exchange"]
+    timeframe = sc["timeframe"]
+
+    if strategy_name == "ignition":
+        strat_cfg, dune_cfg = _strategy_cfgs(sc)
+        if no_dune:
+            dune_cfg = None
+        if btc_regime:
+            strat_cfg.require_btc_uptrend = True
+        if max_dist_breakout is not None:
+            strat_cfg.max_dist_to_breakout_pct = max_dist_breakout
+    elif strategy_name == "mean_reversion":
+        mr_dict = sc.get("mean_reversion", {})
+        strat_cfg = MeanReversionConfig.from_dict(mr_dict.get("params", mr_dict))
+        dune_cfg = None
+        if btc_regime or max_dist_breakout is not None:
+            click.echo(
+                "Note: --btc-regime / --max-dist-breakout are ignored for "
+                "mean_reversion strategy."
+            )
+    else:  # funding_carry
+        fc_dict = sc.get("funding_carry", {})
+        strat_cfg = FundingCarryConfig.from_dict(fc_dict.get("params", fc_dict))
+        dune_cfg = None
+        if btc_regime or max_dist_breakout is not None:
+            click.echo(
+                "Note: --btc-regime / --max-dist-breakout are ignored for "
+                "funding_carry strategy."
+            )
+    if time_stop_hours is not None:
+        strat_cfg.max_hold_hours = time_stop_hours
+    if trail_pct is not None:
+        strat_cfg.trail_pct = trail_pct
+    if atr_stop_mult is not None:
+        strat_cfg.atr_stop_mult = atr_stop_mult
+
+    base_bt = sc.get("backtest", {})
+    bt_cfg = BacktestConfig(
+        initial_capital=base_bt.get("initial_capital", 10_000),
+        fee_rate=base_bt.get("fee_rate", 0.0004),
+        slippage_pct=slippage_pct,
+        position_fraction=position_fraction,
+        funding_rate_per_8h_pct=funding_per_8h_pct,
+    )
+    out_root: Path = ctx.obj["out"]
+
+    if extra_symbols:
+        symbols = list(extra_symbols)
+    elif source == "pool":
+        path = _resolve_pool_csv(out_root, exchange)
+        if path is None:
+            raise click.ClickException(
+                "No pool CSV. Run `cq build-pool` or pass --symbol."
+            )
+        symbols = pd.read_csv(path)["symbol"].tolist()
+    else:
+        symbols = [sc.get("symbol", "PEPE/USDT:USDT")]
+
+    click.echo(
+        f"Honest backtest [{strategy_name}]: {len(symbols)} symbols, "
+        f"{days}d total, OOS={oos_days}d"
+    )
+    click.echo(
+        f"  pos={position_fraction*100:.0f}%  slip={slippage_pct}%/side  "
+        f"fund={funding_per_8h_pct}%/8h  dune={'on' if dune_cfg else 'off'}"
+    )
+    click.echo(
+        f"  time_stop={strat_cfg.max_hold_hours}h  "
+        f"trail={strat_cfg.trail_pct}%  atr_mult={strat_cfg.atr_stop_mult}"
+        + (f"  tag={tag}" if tag else "")
+        + "\n"
+    )
+
+    from crypto_quant.backtest.honest import (
+        format_honest_report,
+        run_honest_backtest,
+    )
+
+    result = run_honest_backtest(
+        symbols,
+        exchange=exchange,
+        timeframe=timeframe,
+        total_days=days,
+        oos_days=oos_days,
+        strat_cfg=strat_cfg,
+        bt_cfg=bt_cfg,
+        out_root=out_root,
+        dune_cfg=dune_cfg,
+        strategy_name=strategy_name,
+    )
+    click.echo("")
+    click.echo(format_honest_report(result))
+
+    if not result.summary.empty:
+        out_dir = out_root / "backtests"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
+        from crypto_quant.data import save_dataframe
+
+        suffix = f"_{tag}" if tag else ""
+        sname = strategy_name.replace("_", "")
+        sp = out_dir / f"honest_{sname}_{exchange}_{ts}{suffix}_summary.csv"
+        save_dataframe(result.summary, sp, format="csv")
+        click.echo(f"\nSummary: {sp}")
+        if not result.trades.empty:
+            tp = out_dir / f"honest_{sname}_{exchange}_{ts}{suffix}_trades.csv"
+            save_dataframe(result.trades, tp, format="csv")
+            click.echo(f"Trades:  {tp}")
+
+
+@main.command("backtest-portfolio")
+@click.option("--strategy", "strategy_name",
+    type=click.Choice(["ignition", "mean_reversion", "funding_carry"]),
+    default="ignition")
+@click.option("--exchange", default=None)
+@click.option("--days", default=90, type=int)
+@click.option("--oos-days", default=30, type=int)
+@click.option("--max-concurrent", default=5, type=int,
+    help="Max simultaneous open positions")
+@click.option("--position-fraction", default=None, type=float,
+    help="Per-trade fraction of CURRENT equity (default: 1/max_concurrent)")
+@click.option("--slippage-pct", default=0.15, type=float)
+@click.option("--funding-per-8h-pct", default=0.03, type=float,
+    help="Constant funding (ignored if per-bar from FundingCarry)")
+@click.option("--source", type=click.Choice(["pool", "symbols"]), default="pool")
+@click.option("--symbol", "extra_symbols", multiple=True)
+@click.option("--no-dune", is_flag=True)
+@click.option("--tag", default=None, type=str)
+@click.pass_context
+def backtest_portfolio_cmd(
+    ctx: click.Context,
+    strategy_name: str,
+    exchange: str | None,
+    days: int,
+    oos_days: int,
+    max_concurrent: int,
+    position_fraction: float | None,
+    slippage_pct: float,
+    funding_per_8h_pct: float,
+    source: str,
+    extra_symbols: tuple[str, ...],
+    no_dune: bool,
+    tag: str | None,
+) -> None:
+    """Portfolio backtest: one account, multiple symbols, concurrent positions."""
+    from crypto_quant.backtest.honest import _make_strategy, _needs_funding
+    from crypto_quant.backtest.portfolio import (
+        PortfolioConfig,
+        format_portfolio_report,
+        run_portfolio_backtest,
+    )
+    from crypto_quant.data.sync import ensure_funding, ensure_ohlcv
+    from crypto_quant.strategy import merge_funding_to_ohlcv
+
+    sc = ctx.obj["cfg"]["strategy"]
+    exchange = exchange or sc["exchange"]
+    timeframe = sc["timeframe"]
+
+    if strategy_name == "ignition":
+        strat_cfg, dune_cfg = _strategy_cfgs(sc)
+        if no_dune:
+            dune_cfg = None
+    elif strategy_name == "mean_reversion":
+        mr = sc.get("mean_reversion", {})
+        strat_cfg = MeanReversionConfig.from_dict(mr.get("params", mr))
+        dune_cfg = None
+    else:
+        fc = sc.get("funding_carry", {})
+        strat_cfg = FundingCarryConfig.from_dict(fc.get("params", fc))
+        dune_cfg = None
+
+    if position_fraction is None:
+        position_fraction = 1.0 / max_concurrent
+
+    bt_cfg = BacktestConfig(
+        initial_capital=sc.get("backtest", {}).get("initial_capital", 10_000),
+        fee_rate=sc.get("backtest", {}).get("fee_rate", 0.0004),
+        slippage_pct=slippage_pct,
+        funding_rate_per_8h_pct=funding_per_8h_pct,
+    )
+    pf_cfg = PortfolioConfig(
+        max_concurrent=max_concurrent,
+        position_fraction=position_fraction,
+    )
+    out_root: Path = ctx.obj["out"]
+
+    if extra_symbols:
+        symbols = list(extra_symbols)
+    elif source == "pool":
+        path = _resolve_pool_csv(out_root, exchange)
+        if path is None:
+            raise click.ClickException("No pool CSV. Run `cq build-pool` or pass --symbol.")
+        symbols = pd.read_csv(path)["symbol"].tolist()
+    else:
+        symbols = [sc.get("symbol", "PEPE/USDT:USDT")]
+
+    click.echo(
+        f"Portfolio backtest [{strategy_name}]: {len(symbols)} symbols, "
+        f"{days}d total, OOS={oos_days}d"
+    )
+    click.echo(
+        f"  max_concur={max_concurrent}  per_pos={position_fraction*100:.0f}%  "
+        f"slip={slippage_pct}%/side  fund={funding_per_8h_pct}%/8h"
+    )
+
+    strategy, _dir = _make_strategy(strategy_name, strat_cfg, dune_cfg)
+    needs_fund = _needs_funding(strategy_name)
+    signals_by_sym: dict[str, pd.DataFrame] = {}
+    bnh_per_sym: dict[str, float] = {}
+    cutoff = None
+
+    for sym in symbols:
+        try:
+            df = ensure_ohlcv(
+                out_root, exchange=exchange, timeframe=timeframe,
+                symbol=sym, days=days, force=False,
+            )
+        except Exception as e:
+            click.echo(f"  skip {sym}: {e}")
+            continue
+        if df.empty or len(df) < 200:
+            click.echo(f"  skip {sym}: insufficient data")
+            continue
+        if cutoff is None:
+            cutoff = df["timestamp"].max() - pd.Timedelta(days=oos_days)
+        if needs_fund:
+            try:
+                fnd = ensure_funding(out_root, exchange=exchange, symbol=sym, days=days)
+            except Exception:
+                fnd = None
+            if fnd is None or fnd.empty:
+                continue
+            df = merge_funding_to_ohlcv(df, fnd)
+        sig = strategy.generate_signals(df)
+        # Restrict to OOS window for the portfolio simulation
+        sig_oos = sig[sig["timestamp"] >= cutoff].reset_index(drop=True)
+        if not sig_oos.empty:
+            signals_by_sym[sym] = sig_oos
+            oos_close = sig_oos["close"]
+            bnh_per_sym[sym] = (oos_close.iloc[-1] / oos_close.iloc[0] - 1) * 100
+
+    if not signals_by_sym:
+        raise click.ClickException("No symbols with usable signals.")
+
+    result = run_portfolio_backtest(
+        signals_by_sym, strat_cfg=strat_cfg, bt_cfg=bt_cfg, pf_cfg=pf_cfg,
+    )
+    # Equal-weight BnH across symbols, scaled by deployed exposure
+    avg_bnh = sum(bnh_per_sym.values()) / len(bnh_per_sym)
+    # Deployed exposure ≈ max_concurrent * position_fraction (cap at 1.0)
+    deployed = min(1.0, max_concurrent * position_fraction)
+    fair_bnh = avg_bnh * deployed
+    click.echo("")
+    click.echo(format_portfolio_report(result, bnh_ret_pct=fair_bnh,
+        label=f"{strategy_name} {oos_days}d OOS"))
+
+    if not result.trades:
+        return
+    out_dir = out_root / "backtests"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
+    suffix = f"_{tag}" if tag else ""
+    trades_df = pd.DataFrame([
+        {**asdict_safely(t), "symbol": getattr(t, "symbol", "?")}
+        for t in result.trades
+    ])
+    tp_path = out_dir / f"portfolio_{strategy_name}_{exchange}_{ts}{suffix}_trades.csv"
+    eq_path = out_dir / f"portfolio_{strategy_name}_{exchange}_{ts}{suffix}_equity.csv"
+    save_dataframe(trades_df, tp_path, format="csv")
+    save_dataframe(result.equity_curve, eq_path, format="csv")
+    click.echo(f"\nTrades:  {tp_path}")
+    click.echo(f"Equity:  {eq_path}")
+
+
+def asdict_safely(obj) -> dict:
+    from dataclasses import asdict as _asdict
+    return _asdict(obj)
+
+
+@main.command("validate")
+@click.option("--strategy", "strategy_name",
+    type=click.Choice(["ignition", "mean_reversion", "funding_carry"]),
+    default="ignition")
+@click.option("--exchange", default=None)
+@click.option("--total-days", default=365, type=int,
+    help="Total cached history to consider")
+@click.option("--window-days", default=30, type=int, help="Each OOS window length")
+@click.option("--n-windows", default=6, type=int, help="Number of non-overlapping OOS windows")
+@click.option("--max-concurrent", default=5, type=int)
+@click.option("--position-fraction", default=None, type=float)
+@click.option("--slippage-pct", default=0.15, type=float)
+@click.option("--funding-per-8h-pct", default=0.03, type=float)
+@click.option("--tiebreaker", type=click.Choice(["alpha", "rank"]), default="rank")
+@click.option("--source", type=click.Choice(["pool", "symbols"]), default="pool")
+@click.option("--symbol", "extra_symbols", multiple=True)
+@click.option("--no-dune", is_flag=True)
+@click.option("--tag", default=None, type=str)
+@click.pass_context
+def validate_cmd(
+    ctx: click.Context,
+    strategy_name: str,
+    exchange: str | None,
+    total_days: int,
+    window_days: int,
+    n_windows: int,
+    max_concurrent: int,
+    position_fraction: float | None,
+    slippage_pct: float,
+    funding_per_8h_pct: float,
+    tiebreaker: str,
+    source: str,
+    extra_symbols: tuple[str, ...],
+    no_dune: bool,
+    tag: str | None,
+) -> None:
+    """Walk-forward validation across N non-overlapping windows.
+
+    Verdict gates: hit_rate >= 67%, mean edge >= +5pp, worst DD > -25%.
+    """
+    from crypto_quant.backtest.honest import _make_strategy, _needs_funding
+    from crypto_quant.backtest.portfolio import PortfolioConfig
+    from crypto_quant.backtest.walk_forward import (
+        format_walk_forward_report,
+        run_walk_forward,
+    )
+
+    sc = ctx.obj["cfg"]["strategy"]
+    exchange = exchange or sc["exchange"]
+    timeframe = sc["timeframe"]
+
+    if strategy_name == "ignition":
+        strat_cfg, dune_cfg = _strategy_cfgs(sc)
+        if no_dune:
+            dune_cfg = None
+    elif strategy_name == "mean_reversion":
+        mr = sc.get("mean_reversion", {})
+        strat_cfg = MeanReversionConfig.from_dict(mr.get("params", mr))
+        dune_cfg = None
+    else:
+        fc = sc.get("funding_carry", {})
+        strat_cfg = FundingCarryConfig.from_dict(fc.get("params", fc))
+        dune_cfg = None
+
+    if position_fraction is None:
+        position_fraction = 1.0 / max_concurrent
+
+    bt_cfg = BacktestConfig(
+        initial_capital=sc.get("backtest", {}).get("initial_capital", 10_000),
+        fee_rate=sc.get("backtest", {}).get("fee_rate", 0.0004),
+        slippage_pct=slippage_pct,
+        funding_rate_per_8h_pct=funding_per_8h_pct,
+    )
+    pf_cfg = PortfolioConfig(
+        max_concurrent=max_concurrent,
+        position_fraction=position_fraction,
+        tiebreaker=tiebreaker,
+    )
+    out_root: Path = ctx.obj["out"]
+
+    if extra_symbols:
+        symbols = list(extra_symbols)
+    elif source == "pool":
+        path = _resolve_pool_csv(out_root, exchange)
+        if path is None:
+            raise click.ClickException("No pool CSV. Run `cq build-pool` first.")
+        symbols = pd.read_csv(path)["symbol"].tolist()
+    else:
+        symbols = [sc.get("symbol", "PEPE/USDT:USDT")]
+
+    strategy, _dir = _make_strategy(strategy_name, strat_cfg, dune_cfg)
+    needs_fund = _needs_funding(strategy_name)
+
+    click.echo(
+        f"Validate [{strategy_name}]: {n_windows}x{window_days}d windows, "
+        f"{len(symbols)} symbols, tiebreaker={tiebreaker}, "
+        f"per_pos={position_fraction*100:.0f}%\n"
+    )
+    result = run_walk_forward(
+        strategy, symbols,
+        out_root=out_root, exchange=exchange, timeframe=timeframe,
+        total_days=total_days, window_days=window_days, n_windows=n_windows,
+        strat_cfg=strat_cfg, bt_cfg=bt_cfg, pf_cfg=pf_cfg,
+        strategy_name=strategy_name, needs_funding=needs_fund,
+    )
+    click.echo("")
+    click.echo(format_walk_forward_report(result))
+
+    if result.windows:
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
+        suffix = f"_{tag}" if tag else ""
+        path = out_root / "backtests" / (
+            f"validate_{strategy_name}_{exchange}_{ts}{suffix}_windows.csv"
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        save_dataframe(result.summary(), path, format="csv")
+        click.echo(f"\nWindows CSV: {path}")
 
 
 @main.command("dune-check")

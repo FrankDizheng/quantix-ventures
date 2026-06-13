@@ -9,27 +9,18 @@ SELECT * FROM cex.flows WHERE blockchain = 'ethereum' LIMIT 3
 SELECT token_address, flow_type, count(*) n
 FROM cex.flows
 WHERE blockchain = 'ethereum'
-  AND lower(cast(token_address as varchar)) = lower('0x6982508145454Ce325ddbe47a25b4ec39f48a223')
+  AND token_symbol = 'PEPE'
   AND block_time >= now() - interval '90' day
 GROUP BY 1, 2
 """,
     "cex.flows": """
 SELECT date_trunc('day', block_time) AS day,
-  coalesce(sum(case when flow_type = 'deposit' then amount_usd else 0 end), 0) AS inflow_usd,
-  coalesce(sum(case when flow_type = 'withdrawal' then amount_usd else 0 end), 0) AS outflow_usd
+  coalesce(sum(case when flow_type = 'Inflow' then amount_usd else 0 end), 0) AS inflow_usd,
+  coalesce(sum(case when flow_type = 'Outflow' then amount_usd else 0 end), 0) AS outflow_usd
 FROM cex.flows
 WHERE blockchain = 'ethereum'
-  AND token_address = 0x6982508145454Ce325ddbe47a25b4ec39f48a223
+  AND token_symbol = 'PEPE'
   AND block_time >= now() - interval '30' day
-GROUP BY 1 ORDER BY 1 LIMIT 5
-""",
-    "tokens.transfers": """
-SELECT date_trunc('day', block_time) AS day,
-  coalesce(sum(amount_usd), 0) AS vol
-FROM tokens.transfers
-WHERE blockchain = 'ethereum'
-  AND token_address = 0x6982508145454Ce325ddbe47a25b4ec39f48a223
-  AND block_time >= now() - interval '7' day
 GROUP BY 1 ORDER BY 1 LIMIT 5
 """,
 }
