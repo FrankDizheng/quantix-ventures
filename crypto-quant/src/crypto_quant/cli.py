@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
+from itertools import combinations
 from pathlib import Path
 
 import click
 import pandas as pd
+import yaml
 
-from crypto_quant.config import data_dir, load_config
+from crypto_quant.config import data_dir, load_config, repo_root
 from crypto_quant.data import (
     BinanceVisionFetcher,
     CCXTFetcher,
@@ -24,7 +26,11 @@ from crypto_quant.backtest import (
     run_batch,
 )
 from crypto_quant.data.storage import load_dataframe
-from crypto_quant.pairs import PairResearchConfig, format_pair_report, rank_pairs
+from crypto_quant.pairs import (
+    PairResearchConfig,
+    diagnose_pairs,
+    format_pair_report,
+)
 from crypto_quant.pool import PoolConfig, build_pool
 from crypto_quant.scan import scan_exchanges
 from crypto_quant.scan.perp_scanner import ScanConfig, format_scan_table
@@ -193,7 +199,9 @@ def scan_perps(
 
 from crypto_quant.data.sync import (
     SyncConfig,
+    ensure_funding,
     ensure_ohlcv,
+    ensure_order_book_snapshot,
     ohlcv_cache_path,
     resolve_pool_symbols,
     resolve_token_map_symbols,
@@ -536,16 +544,136 @@ def _resolve_pool_csv(out_root: Path, exchange: str) -> Path | None:
     return candidates[-1] if candidates else None
 
 
+def _load_pair_research_config(path: Path | None) -> dict:
+    cfg_path = path or (repo_root() / "config" / "pairs.yaml")
+    if not cfg_path.exists():
+        return {}
+    with cfg_path.open(encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+def _pair_candidate_set(
+    symbols: list[str],
+    pair_cfg: dict,
+    *,
+    all_combos: bool,
+) -> tuple[list[tuple[str, str]], dict[tuple[str, str], str]]:
+    symbol_set = set(symbols)
+    if all_combos:
+        pairs = list(combinations(sorted(symbol_set), 2))
+        return pairs, {pair: "all_combos" for pair in pairs}
+
+    groups = pair_cfg.get("groups", {}) or {}
+    pairs: list[tuple[str, str]] = []
+    pair_group: dict[tuple[str, str], str] = {}
+    seen: set[tuple[str, str]] = set()
+    for group_name, group_symbols in groups.items():
+        present = sorted({str(sym) for sym in group_symbols if str(sym) in symbol_set})
+        for symbol_a, symbol_b in combinations(present, 2):
+            pair = (symbol_a, symbol_b)
+            if pair in seen:
+                continue
+            seen.add(pair)
+            pairs.append(pair)
+            pair_group[pair] = str(group_name)
+
+    if pairs:
+        return pairs, pair_group
+
+    pairs = list(combinations(sorted(symbol_set), 2))
+    return pairs, {pair: "ungrouped_fallback" for pair in pairs}
+
+
+def _symbols_from_pair_groups(pair_cfg: dict) -> list[str]:
+    groups = pair_cfg.get("groups", {}) or {}
+    symbols = {
+        str(symbol)
+        for group_symbols in groups.values()
+        for symbol in (group_symbols or [])
+    }
+    return sorted(symbols)
+
+
+def _pair_research_cfg(
+    pair_cfg: dict,
+    *,
+    lookback_hours: int,
+    min_overlap: int,
+    min_corr: float,
+    z_window: int,
+    entry_z: float,
+) -> PairResearchConfig:
+    research = pair_cfg.get("research", {}) or {}
+    base = PairResearchConfig()
+    return PairResearchConfig(
+        lookback_hours=lookback_hours,
+        min_overlap=min_overlap,
+        min_corr=min_corr,
+        z_window=z_window,
+        entry_z=entry_z,
+        exit_z=research.get("exit_z", base.exit_z),
+        stop_z=research.get("stop_z", base.stop_z),
+        min_trades=research.get("min_trades", base.min_trades),
+        min_half_life_hours=research.get(
+            "min_half_life_hours", base.min_half_life_hours
+        ),
+        max_half_life_hours=research.get(
+            "max_half_life_hours", base.max_half_life_hours
+        ),
+        rolling_window_hours=research.get(
+            "rolling_window_hours", base.rolling_window_hours
+        ),
+        min_rolling_corr=research.get("min_rolling_corr", base.min_rolling_corr),
+        max_beta_cv=research.get("max_beta_cv", base.max_beta_cv),
+        max_beta_drift_pct=research.get(
+            "max_beta_drift_pct", base.max_beta_drift_pct
+        ),
+        min_convergence_rate_pct=research.get(
+            "min_convergence_rate_pct", base.min_convergence_rate_pct
+        ),
+        min_cost_edge_ratio=research.get(
+            "min_cost_edge_ratio", base.min_cost_edge_ratio
+        ),
+        fee_rate=research.get("fee_rate", base.fee_rate),
+        slippage_pct=research.get("slippage_pct", base.slippage_pct),
+        active_min_score=research.get("active_min_score", base.active_min_score),
+        active_min_stability=research.get(
+            "active_min_stability", base.active_min_stability
+        ),
+        watchlist_min_score=research.get(
+            "watchlist_min_score", base.watchlist_min_score
+        ),
+        funding_enabled=research.get("funding_enabled", base.funding_enabled),
+        order_book_enabled=research.get(
+            "order_book_enabled", base.order_book_enabled
+        ),
+        order_book_max_stale_minutes=research.get(
+            "order_book_max_stale_minutes", base.order_book_max_stale_minutes
+        ),
+        min_depth_25bps_usd=research.get(
+            "min_depth_25bps_usd", base.min_depth_25bps_usd
+        ),
+        min_liquidity_cost_edge_ratio=research.get(
+            "min_liquidity_cost_edge_ratio", base.min_liquidity_cost_edge_ratio
+        ),
+        max_pair_spread_bps=research.get(
+            "max_pair_spread_bps", base.max_pair_spread_bps
+        ),
+    )
+
+
 @main.command("research-pairs")
 @click.option("--pool", "pool_path", type=click.Path(path_type=Path), default=None)
 @click.option("--exchange", default=None)
 @click.option("--symbol", "extra_symbols", multiple=True, help="Override pool with explicit symbols")
+@click.option("--pairs-config", type=click.Path(path_type=Path), default=None)
+@click.option("--all-combos", is_flag=True, help="Ignore pairs.yaml groups and evaluate all pairs")
 @click.option("--days", default=None, type=int, help="OHLCV days to load/fetch")
-@click.option("--lookback-hours", default=720, type=int)
-@click.option("--min-overlap", default=240, type=int)
-@click.option("--min-corr", default=0.55, type=float)
-@click.option("--z-window", default=120, type=int)
-@click.option("--entry-z", default=2.0, type=float)
+@click.option("--lookback-hours", default=None, type=int)
+@click.option("--min-overlap", default=None, type=int)
+@click.option("--min-corr", default=None, type=float)
+@click.option("--z-window", default=None, type=int)
+@click.option("--entry-z", default=None, type=float)
 @click.option("--top", default=10, type=int)
 @click.option("--use-cache/--fetch", default=True)
 @click.pass_context
@@ -554,12 +682,14 @@ def research_pairs_cmd(
     pool_path: Path | None,
     exchange: str | None,
     extra_symbols: tuple[str, ...],
+    pairs_config: Path | None,
+    all_combos: bool,
     days: int | None,
-    lookback_hours: int,
-    min_overlap: int,
-    min_corr: float,
-    z_window: int,
-    entry_z: float,
+    lookback_hours: int | None,
+    min_overlap: int | None,
+    min_corr: float | None,
+    z_window: int | None,
+    entry_z: float | None,
     top: int,
     use_cache: bool,
 ) -> None:
@@ -567,26 +697,75 @@ def research_pairs_cmd(
     sc = ctx.obj["cfg"]["strategy"]
     exchange = exchange or sc["exchange"]
     timeframe = sc["timeframe"]
-    lookback_days = days or max(sc.get("lookback_days", 90), int(lookback_hours / 24) + 7)
     out_root: Path = ctx.obj["out"]
+    pair_cfg = _load_pair_research_config(pairs_config)
+    research_defaults = pair_cfg.get("research", {}) or {}
+    default_pair_cfg = PairResearchConfig()
+    lookback_hours = int(
+        lookback_hours
+        if lookback_hours is not None
+        else research_defaults.get("lookback_hours", default_pair_cfg.lookback_hours)
+    )
+    min_overlap = int(
+        min_overlap
+        if min_overlap is not None
+        else research_defaults.get("min_overlap", default_pair_cfg.min_overlap)
+    )
+    min_corr = float(
+        min_corr
+        if min_corr is not None
+        else research_defaults.get("min_corr", default_pair_cfg.min_corr)
+    )
+    z_window = int(
+        z_window
+        if z_window is not None
+        else research_defaults.get("z_window", default_pair_cfg.z_window)
+    )
+    entry_z = float(
+        entry_z
+        if entry_z is not None
+        else research_defaults.get("entry_z", default_pair_cfg.entry_z)
+    )
+    lookback_days = days or max(
+        sc.get("lookback_days", 90), int(lookback_hours / 24) + 7
+    )
+    cfg = _pair_research_cfg(
+        pair_cfg,
+        lookback_hours=lookback_hours,
+        min_overlap=min_overlap,
+        min_corr=min_corr,
+        z_window=z_window,
+        entry_z=entry_z,
+    )
 
     if extra_symbols:
         symbols = list(extra_symbols)
         click.echo(f"Using {len(symbols)} symbols from --symbol")
     else:
         path = pool_path or _resolve_pool_csv(out_root, exchange)
+        config_symbols = _symbols_from_pair_groups(pair_cfg)
         if path is None or not path.exists():
-            raise click.ClickException(
-                "No pool CSV found. Run `cq build-pool` first or pass --symbol."
-            )
-        click.echo(f"Loading pool: {path}")
-        symbols = pd.read_csv(path)["symbol"].dropna().astype(str).tolist()
+            if config_symbols:
+                symbols = config_symbols
+                click.echo(f"Using {len(symbols)} symbols from pairs config groups")
+            else:
+                raise click.ClickException(
+                    "No pool CSV found. Run `cq build-pool` first or pass --symbol."
+                )
+        elif config_symbols:
+            symbols = config_symbols
+            click.echo(f"Using {len(symbols)} symbols from pairs config groups")
+        else:
+            click.echo(f"Loading pool: {path}")
+            symbols = pd.read_csv(path)["symbol"].dropna().astype(str).tolist()
 
     if len(symbols) < 2:
         raise click.ClickException("Need at least two symbols for pair research.")
 
     sync_cfg = SyncConfig.from_cfg(ctx.obj["cfg"])
     ohlcv_by_symbol: dict[str, pd.DataFrame] = {}
+    funding_by_symbol: dict[str, pd.DataFrame] = {}
+    order_book_by_symbol: dict[str, pd.DataFrame] = {}
     for sym in symbols:
         try:
             df = ensure_ohlcv(
@@ -601,29 +780,330 @@ def research_pairs_cmd(
             if not df.empty:
                 ohlcv_by_symbol[sym] = df
                 click.echo(f"[pair] {sym}: {len(df)} bars")
+                if cfg.funding_enabled:
+                    try:
+                        fnd = ensure_funding(
+                            out_root,
+                            exchange=exchange,
+                            symbol=sym,
+                            days=lookback_days,
+                            max_stale_hours=sync_cfg.max_stale_hours,
+                            force=not use_cache,
+                        )
+                        if not fnd.empty:
+                            funding_by_symbol[sym] = fnd
+                            click.echo(f"[funding] {sym}: {len(fnd)} rows")
+                    except Exception as e:
+                        click.echo(f"[funding] {sym}: skip ({e})")
+                if cfg.order_book_enabled:
+                    try:
+                        ob = ensure_order_book_snapshot(
+                            out_root,
+                            exchange=exchange,
+                            symbol=sym,
+                            max_stale_minutes=cfg.order_book_max_stale_minutes,
+                            force=not use_cache,
+                        )
+                        if not ob.empty:
+                            order_book_by_symbol[sym] = ob
+                            spread_bps = float(ob["spread_bps"].iloc[-1])
+                            click.echo(f"[book] {sym}: spread={spread_bps:.2f} bps")
+                    except Exception as e:
+                        click.echo(f"[book] {sym}: skip ({e})")
         except Exception as e:
             click.echo(f"[pair] {sym}: skip ({e})")
 
-    cfg = PairResearchConfig(
-        lookback_hours=lookback_hours,
-        min_overlap=min_overlap,
-        min_corr=min_corr,
-        z_window=z_window,
-        entry_z=entry_z,
+    candidate_pairs, pair_group = _pair_candidate_set(
+        list(ohlcv_by_symbol),
+        pair_cfg,
+        all_combos=all_combos,
     )
-    ranked = rank_pairs(ohlcv_by_symbol, cfg)
+    click.echo(f"Evaluating {len(candidate_pairs)} candidate pairs")
+
+    diagnostics = diagnose_pairs(
+        ohlcv_by_symbol,
+        cfg,
+        candidate_pairs=candidate_pairs,
+        funding_by_symbol=funding_by_symbol,
+        order_book_by_symbol=order_book_by_symbol,
+    )
+    if not diagnostics.empty:
+        diagnostics["group"] = diagnostics.apply(
+            lambda row: pair_group.get((row["symbol_a"], row["symbol_b"]), ""),
+            axis=1,
+        )
+    ranked = diagnostics[diagnostics["passed"]].copy() if not diagnostics.empty else diagnostics
+    rejected = diagnostics[~diagnostics["passed"]].copy() if not diagnostics.empty else diagnostics
+
     click.echo("")
     click.echo(format_pair_report(ranked, top=top))
+    if not diagnostics.empty:
+        click.echo("\nStatus counts:")
+        click.echo(diagnostics["status"].value_counts().to_string())
+    if not rejected.empty:
+        click.echo("\nRejected reasons:")
+        click.echo(rejected["reject_reason"].value_counts().to_string())
 
     out_dir = out_root / "pairs"
     out_dir.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     path = out_dir / f"pairs_{exchange}_{ts}.csv"
     latest = out_dir / f"pairs_{exchange}_latest.csv"
+    diagnostics_path = out_dir / f"pairs_{exchange}_{ts}_diagnostics.csv"
+    diagnostics_latest = out_dir / f"pairs_{exchange}_diagnostics_latest.csv"
+    rejected_path = out_dir / f"pairs_{exchange}_{ts}_rejected.csv"
+    rejected_latest = out_dir / f"pairs_{exchange}_rejected_latest.csv"
     save_dataframe(ranked, path, format="csv")
     save_dataframe(ranked, latest, format="csv")
+    save_dataframe(diagnostics, diagnostics_path, format="csv")
+    save_dataframe(diagnostics, diagnostics_latest, format="csv")
+    save_dataframe(rejected, rejected_path, format="csv")
+    save_dataframe(rejected, rejected_latest, format="csv")
     click.echo(f"\nSaved pairs: {path}")
     click.echo(f"Latest:      {latest}")
+    click.echo(f"Diagnostics: {diagnostics_latest}")
+    click.echo(f"Rejected:    {rejected_latest}")
+
+
+def _pair_diagnostic_history(out_dir: Path, exchange: str) -> pd.DataFrame:
+    frames: list[pd.DataFrame] = []
+    for path in sorted(out_dir.glob(f"pairs_{exchange}_*_diagnostics.csv")):
+        if "latest" in path.name:
+            continue
+        df = pd.read_csv(path)
+        if df.empty:
+            continue
+        snapshot = path.name.removeprefix(f"pairs_{exchange}_").removesuffix("_diagnostics.csv")
+        df = df.copy()
+        df["snapshot"] = snapshot
+        df["snapshot_ts"] = pd.to_datetime(snapshot, format="%Y%m%d_%H%M%S", errors="coerce")
+        if df["snapshot_ts"].isna().all():
+            df["snapshot_ts"] = pd.to_datetime(snapshot, format="%Y%m%d_%H%M", errors="coerce")
+        frames.append(df)
+
+    if not frames:
+        return pd.DataFrame()
+    history = pd.concat(frames, ignore_index=True)
+    history["pair"] = history["symbol_a"].astype(str) + " / " + history["symbol_b"].astype(str)
+    history["passed"] = history["status"].isin(["active_research", "watchlist"])
+    return history
+
+
+def _pair_persistence_summary(
+    history: pd.DataFrame,
+    *,
+    min_pass_rate: float,
+    min_active_snapshots: int,
+    min_passed_snapshots: int,
+) -> pd.DataFrame:
+    if history.empty:
+        return pd.DataFrame()
+
+    status = history["status"].astype(str)
+    history = history.copy()
+    history["is_active"] = status.eq("active_research")
+    history["is_watchlist"] = status.eq("watchlist")
+
+    grouped = history.groupby(["pair", "symbol_a", "symbol_b"], dropna=False)
+    summary = grouped.agg(
+        snapshots_seen=("snapshot", "nunique"),
+        passed_snapshots=("passed", "sum"),
+        active_snapshots=("is_active", "sum"),
+        watchlist_snapshots=("is_watchlist", "sum"),
+        mean_score=("score", "mean"),
+        mean_stability=("stability_score", "mean"),
+        latest_snapshot=("snapshot", "max"),
+    ).reset_index()
+    summary["pass_rate"] = summary["passed_snapshots"] / summary["snapshots_seen"]
+    summary["active_rate"] = summary["active_snapshots"] / summary["snapshots_seen"]
+
+    latest = (
+        history.sort_values(["pair", "snapshot_ts", "snapshot"])
+        .groupby("pair", as_index=False)
+        .tail(1)
+    )
+    latest_cols = [
+        "pair",
+        "status",
+        "score",
+        "stability_score",
+        "corr",
+        "rolling_corr_p20",
+        "cost_edge_ratio",
+        "pair_spread_bps",
+        "min_depth_25bps_usd",
+        "liquidity_cost_edge_ratio",
+        "reject_reason",
+        "group",
+    ]
+    latest_cols = [col for col in latest_cols if col in latest.columns]
+    latest = latest[latest_cols].rename(
+        columns={
+            "status": "latest_status",
+            "score": "latest_score",
+            "stability_score": "latest_stability_score",
+            "reject_reason": "latest_reject_reason",
+            "group": "latest_group",
+        }
+    )
+    summary = summary.merge(latest, on="pair", how="left")
+
+    active_latest = summary["latest_status"].eq("active_research")
+    passed_latest = summary["latest_status"].isin(["active_research", "watchlist"])
+    summary["persistence_status"] = "rejected_or_decayed"
+    summary.loc[
+        active_latest
+        & (summary["active_snapshots"] >= min_active_snapshots)
+        & (summary["pass_rate"] >= min_pass_rate),
+        "persistence_status",
+    ] = "persistent_active"
+    summary.loc[
+        passed_latest
+        & summary["persistence_status"].eq("rejected_or_decayed")
+        & (summary["passed_snapshots"] >= min_passed_snapshots)
+        & (summary["pass_rate"] >= min_pass_rate),
+        "persistence_status",
+    ] = "persistent_watchlist"
+    summary.loc[
+        passed_latest
+        & summary["persistence_status"].eq("rejected_or_decayed"),
+        "persistence_status",
+    ] = "new_candidate"
+
+    status_rank = {
+        "persistent_active": 0,
+        "persistent_watchlist": 1,
+        "new_candidate": 2,
+        "rejected_or_decayed": 3,
+    }
+    summary["_status_rank"] = summary["persistence_status"].map(status_rank).fillna(9)
+    summary = summary.sort_values(
+        [
+            "_status_rank",
+            "latest_score",
+            "latest_stability_score",
+            "active_snapshots",
+            "pass_rate",
+        ],
+        ascending=[True, False, False, False, False],
+    ).drop(columns=["_status_rank"])
+    return summary.reset_index(drop=True)
+
+
+def _persistence_pool_columns(df: pd.DataFrame) -> list[str]:
+    preferred = [
+        "pair",
+        "symbol_a",
+        "symbol_b",
+        "persistence_status",
+        "snapshots_seen",
+        "passed_snapshots",
+        "active_snapshots",
+        "pass_rate",
+        "active_rate",
+        "latest_status",
+        "latest_score",
+        "latest_stability_score",
+        "corr",
+        "rolling_corr_p20",
+        "cost_edge_ratio",
+        "pair_spread_bps",
+        "min_depth_25bps_usd",
+        "liquidity_cost_edge_ratio",
+        "latest_group",
+        "latest_snapshot",
+        "latest_reject_reason",
+    ]
+    return [col for col in preferred if col in df.columns]
+
+
+def _save_persistence_pools(
+    summary: pd.DataFrame,
+    out_dir: Path,
+    *,
+    exchange: str,
+) -> dict[str, Path]:
+    pools = {
+        "persistent_active": summary[
+            summary["persistence_status"].eq("persistent_active")
+        ],
+        "persistent_watchlist": summary[
+            summary["persistence_status"].eq("persistent_watchlist")
+        ],
+        "new_candidate": summary[summary["persistence_status"].eq("new_candidate")],
+    }
+    columns = _persistence_pool_columns(summary)
+    paths: dict[str, Path] = {}
+    for pool_name, pool_df in pools.items():
+        path = out_dir / f"pairs_{exchange}_{pool_name}_latest.csv"
+        save_dataframe(pool_df[columns].copy(), path, format="csv")
+        paths[pool_name] = path
+    return paths
+
+
+@main.command("pair-persistence")
+@click.option("--exchange", default=None)
+@click.option("--min-pass-rate", default=0.60, show_default=True, type=float)
+@click.option("--min-active-snapshots", default=2, show_default=True, type=int)
+@click.option("--min-passed-snapshots", default=2, show_default=True, type=int)
+@click.option("--top", default=30, show_default=True, type=int)
+@click.pass_context
+def pair_persistence_cmd(
+    ctx: click.Context,
+    exchange: str | None,
+    min_pass_rate: float,
+    min_active_snapshots: int,
+    min_passed_snapshots: int,
+    top: int,
+) -> None:
+    """Summarize pair stability across historical diagnostics snapshots."""
+    sc = ctx.obj["cfg"]["strategy"]
+    exchange = exchange or sc["exchange"]
+    out_dir: Path = ctx.obj["out"] / "pairs"
+    history = _pair_diagnostic_history(out_dir, exchange)
+    if history.empty:
+        raise click.ClickException("No timestamped pair diagnostics found.")
+
+    summary = _pair_persistence_summary(
+        history,
+        min_pass_rate=min_pass_rate,
+        min_active_snapshots=min_active_snapshots,
+        min_passed_snapshots=min_passed_snapshots,
+    )
+    if summary.empty:
+        raise click.ClickException("Pair persistence summary came back empty.")
+
+    cols = [
+        "pair",
+        "persistence_status",
+        "snapshots_seen",
+        "passed_snapshots",
+        "active_snapshots",
+        "pass_rate",
+        "latest_status",
+        "latest_score",
+        "latest_stability_score",
+        "latest_group",
+    ]
+    show = summary[[col for col in cols if col in summary.columns]].head(top).copy()
+    for col in ("pass_rate", "latest_score", "latest_stability_score"):
+        if col in show.columns:
+            show[col] = show[col].round(3)
+
+    click.echo("\nPersistence counts:")
+    click.echo(summary["persistence_status"].value_counts().to_string())
+    click.echo("")
+    click.echo(show.to_string(index=False))
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"pairs_{exchange}_persistence_latest.csv"
+    save_dataframe(summary, path, format="csv")
+    pool_paths = _save_persistence_pools(summary, out_dir, exchange=exchange)
+    click.echo(f"\nPersistence: {path}")
+    click.echo("Candidate pools:")
+    for pool_name, pool_path in pool_paths.items():
+        count = int(summary["persistence_status"].eq(pool_name).sum())
+        click.echo(f"  {pool_name}: {count} -> {pool_path}")
 
 
 @main.command("backtest-batch")

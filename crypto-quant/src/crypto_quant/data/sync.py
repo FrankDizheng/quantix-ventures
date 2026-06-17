@@ -23,6 +23,40 @@ def funding_cache_path(out_root: Path, exchange: str, symbol: str) -> Path:
     return out_root / "funding" / exchange / f"{safe}.parquet"
 
 
+def order_book_cache_path(out_root: Path, exchange: str, symbol: str) -> Path:
+    safe = symbol.replace("/", "_").replace(":", "_")
+    return out_root / "orderbook" / exchange / f"{safe}_latest.parquet"
+
+
+def ensure_order_book_snapshot(
+    out_root: Path,
+    *,
+    exchange: str,
+    symbol: str,
+    max_stale_minutes: float = 15.0,
+    force: bool = False,
+    fetcher: CCXTFetcher | None = None,
+) -> pd.DataFrame:
+    """Load a recent order-book snapshot or fetch a fresh one."""
+    path = order_book_cache_path(out_root, exchange, symbol)
+    if not force and path.exists():
+        try:
+            cached = load_dataframe(path)
+            if not cached.empty:
+                ts = pd.to_datetime(cached["timestamp"].iloc[-1], utc=True)
+                age_min = (datetime.now(timezone.utc) - ts).total_seconds() / 60
+                if age_min <= max_stale_minutes:
+                    return cached
+        except Exception:
+            pass
+
+    fetcher = fetcher or CCXTFetcher(exchange, rate_limit_ms=200)
+    df = fetcher.fetch_order_book_snapshot(symbol)
+    if not df.empty:
+        save_dataframe(df, path)
+    return df
+
+
 def ensure_funding(
     out_root: Path,
     *,

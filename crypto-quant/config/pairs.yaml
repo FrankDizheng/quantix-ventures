@@ -1,0 +1,110 @@
+# Pair research is deliberately group-first: we mine relationships that have
+# at least a plausible shared narrative before looking at z-score opportunities.
+
+research:
+  # Core relationship window: 30d of 1h bars inside a larger local cache.
+  lookback_hours: 720
+  min_overlap: 500
+  min_corr: 0.55
+
+  # Spread excursion scan. These are research thresholds, not trading rules.
+  z_window: 120
+  entry_z: 2.0
+  exit_z: 0.5
+  stop_z: 3.5
+  min_trades: 3
+  min_convergence_rate_pct: 45.0
+
+  # Mean-reversion speed: too fast is microstructure noise, too slow ties up capital.
+  min_half_life_hours: 4.0
+  max_half_life_hours: 120.0
+
+  # Stability checks: a pair is only useful if its hedge relationship survives
+  # rolling windows, not just the full sample.
+  rolling_window_hours: 240
+  min_rolling_corr: 0.35
+  max_beta_cv: 1.0
+  max_beta_drift_pct: 120.0
+
+  # Conservative small-cap two-leg round-trip cost model.
+  fee_rate: 0.0004
+  slippage_pct: 0.15
+  min_cost_edge_ratio: 1.2
+
+  # Funding is diagnostic-only at this stage: show carry drag, do not filter.
+  funding_enabled: true
+
+  # Order book is also diagnostic-only for now: show executable spread/depth
+  # and compare fixed cost assumptions with current real liquidity.
+  order_book_enabled: true
+  order_book_max_stale_minutes: 15
+  max_pair_spread_bps: 20.0
+  min_depth_25bps_usd: 10000
+  min_liquidity_cost_edge_ratio: 1.5
+
+  # Candidate pool tiers.
+  active_min_score: 0.80
+  active_min_stability: 0.65
+  watchlist_min_score: 0.65
+
+groups:
+  ai_data:
+    - GRASS/USDT:USDT
+    - KAITO/USDT:USDT
+    - EDEN/USDT:USDT
+    - VIRTUAL/USDT:USDT
+    - LPT/USDT:USDT
+
+  gaming_metaverse:
+    - APE/USDT:USDT
+    - AXS/USDT:USDT
+    - ENJ/USDT:USDT
+    - YGG/USDT:USDT
+    - GMT/USDT:USDT
+
+  infra_l1:
+    - ASTER/USDT:USDT
+    - BERA/USDT:USDT
+    - LIT/USDT:USDT
+    - IP/USDT:USDT
+    - CORE/USDT:USDT
+    - EGLD/USDT:USDT
+    - STRK/USDT:USDT
+    - LINEA/USDT:USDT
+    - EIGEN/USDT:USDT
+    - KSM/USDT:USDT
+    - 0G/USDT:USDT
+    - VANA/USDT:USDT
+
+  market_infra:
+    - AUCTION/USDT:USDT
+    - BERA/USDT:USDT
+    - IP/USDT:USDT
+    - ASTER/USDT:USDT
+    - ENS/USDT:USDT
+    - ENSO/USDT:USDT
+    - ME/USDT:USDT
+
+  attention_beta:
+    - AUCTION/USDT:USDT
+    - BEAT/USDT:USDT
+    - APE/USDT:USDT
+    - AXS/USDT:USDT
+    - WIF/USDT:USDT
+    - PUMP/USDT:USDT
+    - JELLYJELLY/USDT:USDT
+    - PEOPLE/USDT:USDT
+    - WLFI/USDT:USDT
+
+  defi_yield:
+    - CRV/USDT:USDT
+    - COMP/USDT:USDT
+    - GMX/USDT:USDT
+    - UMA/USDT:USDT
+    - JTO/USDT:USDT
+    - ETHFI/USDT:USDT
+    - SSV/USDT:USDT
+
+  rwa_desci:
+    - ONDO/USDT:USDT
+    - BIO/USDT:USDT

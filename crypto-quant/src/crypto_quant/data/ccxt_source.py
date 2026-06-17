@@ -137,6 +137,63 @@ class CCXTFetcher:
             df = df[df["timestamp"] <= pd.Timestamp(until_ms, unit="ms", tz="UTC")]
         return df.sort_values("timestamp").reset_index(drop=True)
 
+    def fetch_order_book_snapshot(
+        self,
+        symbol: str,
+        *,
+        limit: int = 50,
+    ) -> pd.DataFrame:
+        """Fetch one order-book snapshot and summarize executable depth.
+
+        Depth fields are quote-notional USD approximations inside a distance
+        from mid price. For USDT linear perps this is close enough for research
+        diagnostics.
+        """
+        self.exchange.load_markets()
+        book = self.exchange.fetch_order_book(symbol, limit=limit)
+        bids = book.get("bids") or []
+        asks = book.get("asks") or []
+        ts = book.get("timestamp") or self._to_ms(datetime.now(timezone.utc))
+        if not bids or not asks:
+            return pd.DataFrame()
+
+        best_bid = float(bids[0][0])
+        best_ask = float(asks[0][0])
+        mid = (best_bid + best_ask) / 2
+        if mid <= 0:
+            return pd.DataFrame()
+
+        def depth_within(levels: list[list[float]], max_bps: float, side: str) -> float:
+            total = 0.0
+            for price_raw, amount_raw, *_rest in levels:
+                price = float(price_raw)
+                amount = float(amount_raw)
+                distance_bps = (
+                    (mid - price) / mid * 10_000
+                    if side == "bid"
+                    else (price - mid) / mid * 10_000
+                )
+                if distance_bps <= max_bps:
+                    total += price * amount
+            return total
+
+        row = {
+            "timestamp": pd.to_datetime(ts, unit="ms", utc=True),
+            "symbol": symbol,
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "mid": mid,
+            "spread_bps": (best_ask - best_bid) / mid * 10_000,
+            "bid_depth_10bps_usd": depth_within(bids, 10, "bid"),
+            "ask_depth_10bps_usd": depth_within(asks, 10, "ask"),
+            "bid_depth_25bps_usd": depth_within(bids, 25, "bid"),
+            "ask_depth_25bps_usd": depth_within(asks, 25, "ask"),
+            "bid_depth_50bps_usd": depth_within(bids, 50, "bid"),
+            "ask_depth_50bps_usd": depth_within(asks, 50, "ask"),
+            "levels": min(len(bids), len(asks)),
+        }
+        return pd.DataFrame([row])
+
     def fetch_trades(
         self,
         symbol: str,
